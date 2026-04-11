@@ -4,7 +4,11 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import atexit
 import threading
@@ -24,12 +28,12 @@ Tool selection:
 - get_flight_details: Get paginated raw rows (default 15, sorted by cheapest). Use after query_flights when building tables.
 - get_price_trend: Per-date cheapest miles for a route. Use for graphing.
 - find_deals: Scan all routes for below-average pricing.
-- search_route: Only if query_flights returns no results or data is stale. Launches a browser scrape (~2 min). Returns IMMEDIATELY — poll scrape_status() right away.
+- search_route: Only if query_flights returns no results or data is stale. Launches a remote scrape (~2 min once environment is ready). First scrape takes 5-10 min (environment creation). Subsequent scrapes reuse the existing environment. Returns IMMEDIATELY — poll scrape_status() right away.
 - submit_mfa: Only after scrape_status returns {"status": "mfa_required"}. Ask the user for their SMS code, then call this.
-- scrape_status: Poll this after search_route. Returns poll_interval_s — use it as your sleep time. During login it returns 3 (fast, to catch MFA). During scraping it adapts to ETA. Also shows window progress and estimated_remaining_s.
+- scrape_status: Poll this after search_route. Returns poll_interval_s — use it as your sleep time. During environment creation it returns 10 (slow, ~5-10 min). During login it returns 3 (fast, to catch MFA). During scraping it adapts to ETA. Also shows window progress and estimated_remaining_s.
 - flight_status: Check data freshness and coverage.
 - add_alert / check_alerts: Price monitoring.
-- stop_session: Shut down the browser when done scraping.
+- stop_session: Delete the remote scraping environment. It auto-cleans after 24h if forgotten.
 
 Scrape workflow:
 1. search_route("YYZ", "LAX") → returns immediately with "starting"
@@ -37,7 +41,7 @@ Scrape workflow:
 3. If scrape_status returns "mfa_required": ask user for SMS code → submit_mfa(code) → resume polling
 4. Continue polling until "complete" or "error" — report window progress to user
 
-MFA may be required on any scrape, not just the first. Sessions are kept alive between routes but United may expire them.
+MFA may be required on any scrape, not just the first. Scraping environments are kept alive between routes but United may expire sessions.
 
 IMPORTANT: When query_flights returns no_results, your next action MUST be search_route. Do not return text to the user. Do not ask for confirmation. Just call search_route.
 
@@ -55,134 +59,217 @@ SORT_KEYS = {
     "cabin": lambda r: (r["cabin"], r["date"], r["miles"]),
 }
 
-# MFA file paths — duplicated from cli.py to avoid heavy import chain
-_MFA_DIR = os.path.join(os.path.expanduser("~"), ".seataero")
-_MFA_REQUEST = os.path.join(_MFA_DIR, "mfa_request")
-_MFA_RESPONSE = os.path.join(_MFA_DIR, "mfa_response")
-
-# Persistent browser session — survives across tool calls
-_session = {
-    "farm": None,        # CookieFarm instance
-    "scraper": None,     # HybridScraper instance
-    "logged_in": False,  # True after successful login+MFA
+# Codespace lifecycle state — survives across tool calls
+_codespace = {
+    "name": None,    # Codespace name from gh create
+    "repo": None,    # owner/repo string
 }
 
-# Active scrape tracking (for MFA handoff)
+# Active scrape tracking (replaces existing _active_scrape)
 _active_scrape = {
-    "thread": None,       # threading.Thread running the scrape
-    "route_key": None,    # (origin, dest) tuple
-    "result": None,       # dict result from scrape_route
-    "error": None,        # Exception if scrape failed
-    "window": 0,          # current window number (1-12)
-    "total_windows": 12,  # total windows to scrape
-    "found_so_far": 0,    # cumulative flights found
-    "stored_so_far": 0,   # cumulative flights stored
-    "phase": "idle",      # idle | starting | login | mfa_required | scraping | complete | error
-    "started_at": None,   # time.time() when scrape began
-    "last_window_at": None,  # time.time() when last window completed
+    "thread": None,
+    "route_key": None,
+    "phase": "idle",  # idle | creating | login | mfa_required | scraping | copying | merging | complete | error
+    "result": None,
+    "error": None,
+    "window": 0,
+    "total_windows": 12,
+    "found_so_far": 0,
+    "stored_so_far": 0,
+    "started_at": None,
 }
 
 
-def _cleanup_mfa_files():
-    """Remove stale MFA request/response files."""
-    for path in (_MFA_REQUEST, _MFA_RESPONSE):
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def _scrape_progress(window, total, found, stored):
-    """Callback for scrape_route — updates _active_scrape progress."""
+def _reset_active_scrape():
+    """Reset _active_scrape to idle defaults."""
     _active_scrape.update({
-        "window": window,
-        "total_windows": total,
-        "found_so_far": found,
-        "stored_so_far": stored,
-        "phase": "scraping",
+        "thread": None, "route_key": None, "phase": "idle",
+        "result": None, "error": None,
+        "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
+        "started_at": None,
     })
-    _active_scrape["last_window_at"] = time.time()
 
 
-def _prompt_sms_file(timeout: int = 300) -> str:
-    """Wait for MFA code via filesystem handoff (used by ensure_logged_in)."""
-    os.makedirs(_MFA_DIR, exist_ok=True)
-    if os.path.exists(_MFA_RESPONSE):
-        os.remove(_MFA_RESPONSE)
-
-    # Signal that MFA is needed
-    with open(_MFA_REQUEST, "w") as f:
-        import json as _json
-        _json.dump({"timestamp": time.time(), "type": "sms"}, f)
-
-    # Poll for response
-    elapsed = 0
-    while elapsed < timeout:
-        if os.path.exists(_MFA_RESPONSE):
-            with open(_MFA_RESPONSE, "r") as f:
-                code = f.read().strip()
-            if code:
-                _cleanup_mfa_files()
-                return code
-        time.sleep(2)
-        elapsed += 2
-
-    raise RuntimeError(f"No MFA code received within {timeout}s")
+def _check_gh_cli():
+    """Verify `gh` is installed. Return error dict or None."""
+    if shutil.which("gh") is None:
+        return {"error": "gh_not_installed",
+                "message": "GitHub CLI (gh) is not installed. Install from https://cli.github.com/"}
+    return None
 
 
-def _ensure_session(mfa_prompt=None):
-    """Start CookieFarm + HybridScraper if not already running. Login if needed."""
-    if _session["farm"] is not None and _session["logged_in"]:
-        return  # Session is warm — reuse
-
-    if _session["farm"] is None:
-        # Import here to avoid loading Playwright at module level
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "experiments"))
-        from cookie_farm import CookieFarm
-        from hybrid_scraper import HybridScraper
-
-        farm = CookieFarm(headless=False, ephemeral=True)
-        farm.start()
-        _session["farm"] = farm
-        logger.info("Cookie farm started")
-
-    if not _session["logged_in"]:
-        _session["farm"].ensure_logged_in(mfa_prompt=mfa_prompt)
-        _session["logged_in"] = True
-        logger.info("Login confirmed")
-
-    if _session["scraper"] is None:
-        from hybrid_scraper import HybridScraper
-        scraper = HybridScraper(_session["farm"], refresh_interval=2)
-        scraper.start()
-        _session["scraper"] = scraper
-        logger.info("Scraper started")
+def _detect_repo():
+    """Detect GitHub repo from current directory. Cache in _codespace['repo']."""
+    if _codespace["repo"]:
+        return _codespace["repo"]
+    result = subprocess.run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to detect GitHub repo: {result.stderr.strip()}")
+    repo = result.stdout.strip()
+    if not repo:
+        raise RuntimeError("Could not detect GitHub repo — ensure you are in a git repo with a GitHub remote.")
+    _codespace["repo"] = repo
+    return repo
 
 
-def _stop_session():
-    """Stop CookieFarm, HybridScraper, clean up."""
-    if _session["scraper"]:
+def _codespace_state(name):
+    """Return the state of a Codespace (Available, Shutdown, etc.) or None if not found."""
+    result = subprocess.run(
+        ["gh", "codespace", "view", "-c", name, "--json", "state", "-q", ".state"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _ensure_codespace():
+    """Return an existing Codespace name or create a new one."""
+    if _codespace["name"]:
+        state = _codespace_state(_codespace["name"])
+        if state in ("Available", "Shutdown", "Starting"):
+            logger.info(f"Reusing codespace {_codespace['name']} (state={state})")
+            return _codespace["name"]
+        # Codespace gone or in unexpected state — create a new one
+        logger.info(f"Codespace {_codespace['name']} state={state}, creating new one")
+        _codespace["name"] = None
+
+    repo = _detect_repo()
+    logger.info(f"Creating codespace for {repo}...")
+    result = subprocess.run(
+        ["gh", "codespace", "create", "-R", repo, "-b", "master",
+         "-m", "basicLinux32gb", "--retention-period", "24h",
+         "--idle-timeout", "30m", "--default-permissions"],
+        capture_output=True, text=True, timeout=900,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create codespace: {result.stderr.strip()}")
+    name = result.stdout.strip()
+    if not name:
+        raise RuntimeError("gh codespace create returned empty name")
+    _codespace["name"] = name
+    logger.info(f"Created codespace: {name}")
+    return name
+
+
+def _delete_codespace():
+    """Delete the active Codespace if one exists. Reset state."""
+    name = _codespace.get("name")
+    if name:
         try:
-            _session["scraper"].stop()
-        except Exception:
-            pass
-        _session["scraper"] = None
-    if _session["farm"]:
+            subprocess.run(
+                ["gh", "codespace", "delete", "-c", name, "--force"],
+                capture_output=True, text=True, timeout=60,
+            )
+            logger.info(f"Deleted codespace: {name}")
+        except Exception as e:
+            logger.warning(f"Failed to delete codespace {name}: {e}")
+        _codespace["name"] = None
+    _reset_active_scrape()
+
+
+def _parse_scrape_stdout(line):
+    """Parse one line of SSH stdout and update _active_scrape dict."""
+    m = re.search(r'Window (\d+)/(\d+)', line)
+    if m:
+        _active_scrape["window"] = int(m.group(1))
+        _active_scrape["total_windows"] = int(m.group(2))
+        _active_scrape["phase"] = "scraping"
+
+    if "MFA_REQUIRED" in line:
+        _active_scrape["phase"] = "mfa_required"
+
+    if "Already logged in" in line or "Login confirmed" in line:
+        _active_scrape["phase"] = "scraping"
+
+    m = re.search(r'Found:\s+(\d+)', line)
+    if m:
+        _active_scrape["found_so_far"] = int(m.group(1))
+
+    m = re.search(r'Stored:\s+(\d+)', line)
+    if m:
+        _active_scrape["stored_so_far"] = int(m.group(1))
+
+
+def _run_codespace_scrape(origin, dest):
+    """Thread target: full Codespace scrape lifecycle."""
+    try:
+        # 1. Ensure codespace exists
+        _active_scrape["phase"] = "creating"
+        cs_name = _ensure_codespace()
+
+        # 2. Login phase
+        _active_scrape["phase"] = "login"
+
+        # 3. Run SSH scrape command
+        cmd = [
+            "gh", "codespace", "ssh", "-c", cs_name, "--",
+            "cd /workspaces/seataero && seataero search {} {} --headless --create-schema --mfa-file".format(
+                origin, dest
+            ),
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        # 4. Read stdout line-by-line
+        for line in proc.stdout:
+            line = line.rstrip('\n')
+            logger.info(f"[ssh] {line}")
+            _parse_scrape_stdout(line)
+
+        # 5. Wait for proc to finish
+        proc.wait()
+        if proc.returncode != 0 and _active_scrape["phase"] != "complete":
+            _active_scrape["error"] = RuntimeError(f"SSH scrape exited with code {proc.returncode}")
+            _active_scrape["phase"] = "error"
+            return
+
+        # 6. Copy DB from codespace
+        _active_scrape["phase"] = "copying"
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="seataero_remote_")
+        os.close(tmp_fd)
         try:
-            _session["farm"].stop()
-        except Exception:
-            pass
-        _session["farm"] = None
-    _session["logged_in"] = False
-    _active_scrape.update({"thread": None, "route_key": None, "result": None, "error": None,
-                            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-                            "phase": "idle", "started_at": None, "last_window_at": None})
-    _cleanup_mfa_files()
-    logger.info("Session stopped")
+            cp_result = subprocess.run(
+                ["gh", "codespace", "cp", "-c", cs_name, "-e",
+                 "remote:~/.seataero/data.db", tmp_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if cp_result.returncode != 0:
+                raise RuntimeError(f"Failed to copy DB: {cp_result.stderr.strip()}")
+
+            # 7. Merge remote DB
+            _active_scrape["phase"] = "merging"
+            merge_result = subprocess.run(
+                [sys.executable, "scripts/merge_remote_db.py", tmp_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if merge_result.returncode != 0:
+                raise RuntimeError(f"Merge failed: {merge_result.stderr.strip()}")
+
+        finally:
+            # 8. Clean up tmp DB file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        # 9. Complete
+        _active_scrape["result"] = {
+            "status": "complete",
+            "route": f"{origin}-{dest}",
+            "found": _active_scrape["found_so_far"],
+            "stored": _active_scrape["stored_so_far"],
+        }
+        _active_scrape["phase"] = "complete"
+        logger.info(f"Scrape complete for {origin}-{dest}")
+
+    except Exception as e:
+        _active_scrape["error"] = e
+        _active_scrape["phase"] = "error"
+        logger.error(f"Codespace scrape failed: {e}", exc_info=True)
 
 
-atexit.register(_stop_session)
+atexit.register(_delete_codespace)
 
 
 def _compute_summary(rows):
@@ -560,12 +647,13 @@ def check_alerts() -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 def search_route(origin: str, destination: str) -> str:
-    """Scrape fresh award flight data from United for a single route. Takes ~2 minutes.
+    """Scrape fresh award flight data from United for a single route via a remote Codespace.
 
     Returns IMMEDIATELY — poll scrape_status() for progress. No blocking wait.
+    First scrape takes 5-10 min (Codespace creation). Subsequent scrapes reuse the environment (~2 min).
 
-    ONLY use this when query_flights returns no results or data is stale. This launches a real
-    browser, logs into United MileagePlus, and scrapes all 12 monthly windows (~337 days).
+    ONLY use this when query_flights returns no results or data is stale. This launches a
+    remote scraping environment, logs into United MileagePlus, and scrapes all 12 monthly windows (~337 days).
 
     MFA may be required on any scrape (not just the first). scrape_status() will return
     "mfa_required" when SMS verification is needed — ask the user for the code, then call submit_mfa.
@@ -577,6 +665,11 @@ def search_route(origin: str, destination: str) -> str:
     origin = origin.upper()
     destination = destination.upper()
 
+    # Check gh CLI is installed
+    gh_err = _check_gh_cli()
+    if gh_err:
+        return json.dumps(gh_err)
+
     # Reject if a scrape is already in progress
     if _active_scrape.get("thread") and _active_scrape["thread"].is_alive():
         return json.dumps({
@@ -584,134 +677,42 @@ def search_route(origin: str, destination: str) -> str:
             "message": "A scrape is already running. Call scrape_status() to check progress.",
         })
 
-    _cleanup_mfa_files()
+    # Determine if we're reusing an existing codespace
+    reusing = _codespace.get("name") is not None
+
+    # Reset active scrape state
     _active_scrape.update({
         "thread": None, "route_key": (origin, destination),
-        "result": None, "error": None,
+        "phase": "creating", "result": None, "error": None,
         "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-        "phase": "starting", "started_at": time.time(),
+        "started_at": time.time(),
     })
 
-    # If session is warm, verify browser health
-    if _session.get("logged_in") and _session.get("scraper"):
-        if not _session["scraper"].is_browser_alive():
-            logger.warning("Browser is dead — tearing down session, will cold start")
-            _stop_session()
-            _active_scrape.update({
-                "route_key": (origin, destination),
-                "phase": "starting", "started_at": time.time(),
-            })
-            # Fall through to cold path
-        else:
-            # Browser is alive — validate United session is still authenticated
-            try:
-                session_valid = _session["farm"].refresh_cookies()
-            except Exception:
-                session_valid = False
-
-            if not session_valid:
-                logger.warning("United session expired — tearing down, will cold start")
-                _stop_session()
-                _active_scrape.update({
-                    "route_key": (origin, destination),
-                    "phase": "starting", "started_at": time.time(),
-                })
-                # Fall through to cold path below
-            else:
-                # Warm scrape — browser is alive, session is good
-                def _run_warm_scrape():
-                    try:
-                        _active_scrape["phase"] = "scraping"
-                        conn = db.get_connection()
-                        from scrape import scrape_route as _scrape
-                        result = _scrape(origin, destination, conn, _session["scraper"],
-                                         delay=7.0, verbose=False,
-                                         progress_cb=_scrape_progress)
-                        conn.close()
-                        _active_scrape["result"] = {
-                            "status": "complete",
-                            "route": f"{origin}-{destination}",
-                            "found": result.get("found", 0),
-                            "stored": result.get("stored", 0),
-                        }
-                        _active_scrape["phase"] = "complete"
-                        # Keep session warm for next route
-                        try:
-                            _session["farm"].refresh_cookies()
-                        except Exception:
-                            pass  # Best effort
-                    except Exception as e:
-                        _active_scrape["error"] = e
-                        _active_scrape["phase"] = "error"
-                        # Tear down session so next call does a clean cold start
-                        logger.warning(f"Warm scrape failed: {e} — tearing down session")
-                        _stop_session()
-                        # Restore fields since _stop_session clears them
-                        _active_scrape["route_key"] = (origin, destination)
-                        _active_scrape["error"] = e
-                        _active_scrape["phase"] = "error"
-
-                thread = threading.Thread(target=_run_warm_scrape, daemon=True)
-                _active_scrape["thread"] = thread
-                thread.start()
-
-                return json.dumps({
-                    "status": "scraping",
-                    "message": "Warm session active. Scraping in background. "
-                               "Poll scrape_status() every few seconds for progress.",
-                    "route": f"{origin}-{destination}",
-                    "poll_interval_s": 3,
-                })
-
-    # Cold session — start farm + login, MFA likely required
-    def _run_cold_scrape():
-        try:
-            _active_scrape["phase"] = "login"
-            _ensure_session(mfa_prompt=_prompt_sms_file)
-            _active_scrape["phase"] = "scraping"
-            conn = db.get_connection()
-            from scrape import scrape_route as _scrape
-            result = _scrape(origin, destination, conn, _session["scraper"],
-                             delay=7.0, verbose=False,
-                             progress_cb=_scrape_progress)
-            conn.close()
-            _active_scrape["result"] = {
-                "status": "complete",
-                "route": f"{origin}-{destination}",
-                "found": result.get("found", 0),
-                "stored": result.get("stored", 0),
-            }
-            _active_scrape["phase"] = "complete"
-            # Keep session warm for next route
-            try:
-                _session["farm"].refresh_cookies()
-            except Exception:
-                pass  # Best effort
-        except Exception as e:
-            _active_scrape["error"] = e
-            _active_scrape["phase"] = "error"
-            logger.error(f"search_route cold scrape failed: {e}", exc_info=True)
-
-    thread = threading.Thread(target=_run_cold_scrape, daemon=True)
+    # Start scrape in background thread
+    thread = threading.Thread(target=_run_codespace_scrape, args=(origin, destination), daemon=True)
     _active_scrape["thread"] = thread
     thread.start()
 
+    if reusing:
+        msg = "Reusing existing environment. Scraping in background."
+    else:
+        msg = "Creating scraping environment (first time takes 5-10 min). Poll scrape_status()."
+
     return json.dumps({
         "status": "starting",
-        "message": "Login in progress. Poll scrape_status() every few seconds — "
-                   "it will prompt for MFA if needed.",
+        "message": msg,
         "route": f"{origin}-{destination}",
-        "poll_interval_s": 3,
+        "poll_interval_s": 10 if not reusing else 3,
     })
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def submit_mfa(code: str) -> str:
-    """Submit the SMS verification code to complete a pending scrape.
+    """Submit the SMS verification code to the remote Codespace to complete a pending scrape.
 
     ONLY call this after search_route or scrape_status returns {"status": "mfa_required"}.
     The SMS code has already been sent to the user's phone at that point — ask them for it.
-    Writes the code and returns immediately. Poll scrape_status() for progress.
+    Pipes the code via SSH stdin and returns immediately. Poll scrape_status() for progress.
 
     Args:
         code: The SMS verification code (typically 6 digits)
@@ -727,11 +728,23 @@ def submit_mfa(code: str) -> str:
             "message": "No scrape is currently waiting for MFA. Call search_route first.",
         })
 
+    if _active_scrape.get("phase") != "mfa_required":
+        return json.dumps({
+            "error": "not_waiting_for_mfa",
+            "message": f"Scrape is in '{_active_scrape.get('phase')}' phase, not waiting for MFA.",
+        })
+
+    cs_name = _codespace.get("name")
+    if not cs_name:
+        return json.dumps({"error": "no_codespace", "message": "No active Codespace."})
+
     try:
-        # Write the MFA code to the response file
-        os.makedirs(_MFA_DIR, exist_ok=True)
-        with open(_MFA_RESPONSE, "w") as f:
-            f.write(code)
+        proc = subprocess.Popen(
+            ["gh", "codespace", "ssh", "-c", cs_name, "--",
+             "cat > /home/vscode/.seataero/mfa_response"],
+            stdin=subprocess.PIPE, text=True,
+        )
+        proc.communicate(input=code, timeout=30)
 
         route_key = _active_scrape.get("route_key", ("?", "?"))
         logger.info(f"MFA code submitted for {route_key[0]}-{route_key[1]}")
@@ -750,10 +763,11 @@ def submit_mfa(code: str) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def scrape_status() -> str:
-    """Check the status of a running or recently completed scrape.
+    """Check the status of a running or recently completed remote scrape.
 
     Call this after search_route or submit_mfa to track progress.
-    Returns current window, flights found so far, completion status,
+    All state comes from stdout parsing — no additional SSH calls.
+    Returns current phase, window progress, flights found, completion status,
     estimated_remaining_s, and poll_interval_s. Use poll_interval_s as
     your sleep time between polls.
     """
@@ -763,11 +777,6 @@ def scrape_status() -> str:
 
     route = f"{route_key[0]}-{route_key[1]}"
     phase = _active_scrape.get("phase", "idle")
-
-    # Check for mid-scrape MFA
-    if os.path.exists(_MFA_REQUEST) and phase != "mfa_required":
-        _active_scrape["phase"] = "mfa_required"
-        phase = "mfa_required"
 
     if phase == "mfa_required":
         return json.dumps({
@@ -797,10 +806,17 @@ def scrape_status() -> str:
     total = _active_scrape.get("total_windows", 12)
     remaining_windows = total - window
 
-    if phase in ("starting", "login"):
+    if phase == "creating":
+        # Codespace creation takes 5-10 minutes
+        estimated_remaining = max(300 - elapsed, 60)
+        poll_interval = 10
+    elif phase == "login":
         # Fast polling during login to catch MFA immediately
         estimated_remaining = remaining_windows * 20
         poll_interval = 3
+    elif phase in ("copying", "merging"):
+        estimated_remaining = 30
+        poll_interval = 5
     elif window > 0 and elapsed > 0:
         avg_per_window = elapsed / window
         estimated_remaining = int(avg_per_window * remaining_windows)
@@ -811,7 +827,7 @@ def scrape_status() -> str:
         poll_interval = 5
 
     status = {
-        "status": phase,  # starting | login | scraping
+        "status": phase,  # creating | login | scraping | copying | merging
         "route": route,
         "window": window,
         "total_windows": total,
@@ -834,16 +850,16 @@ def scrape_status() -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 def stop_session() -> str:
-    """Stop the persistent browser session and clean up resources.
+    """Delete the remote scraping environment (Codespace) and clean up.
 
-    Call this when done scraping to shut down the browser. The session also
-    auto-stops when the MCP server shuts down.
+    Call this when done scraping to free resources. The environment also
+    auto-deletes after 24h if forgotten. Auto-cleans on MCP server shutdown.
     """
-    was_running = _session["farm"] is not None
-    _stop_session()
+    was_running = _codespace.get("name") is not None
+    _delete_codespace()
     return json.dumps({
         "status": "stopped" if was_running else "not_running",
-        "message": "Browser session stopped." if was_running else "No active session.",
+        "message": "Scraping environment deleted." if was_running else "No active environment.",
     })
 
 

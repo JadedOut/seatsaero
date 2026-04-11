@@ -70,6 +70,7 @@ def _prompt_sms_file(timeout: int = 300) -> str:
         json.dump(request, f)
 
     _log(f"MFA code required — write code to: {_MFA_RESPONSE}")
+    print("MFA_REQUIRED", flush=True)  # stdout marker for SSH stdout parsing
 
     # Poll for response
     elapsed = 0

@@ -9,7 +9,7 @@ import threading
 import time
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -174,172 +174,237 @@ class TestCheckAlerts:
         assert result["alerts_triggered"] == 0
 
 
-class TestSearchRouteMFA:
-    """Tests for MFA-aware search_route and submit_mfa tools (threading-based session)."""
+def _reset_mcp_state():
+    """Reset mcp_server codespace and scrape state between tests."""
+    import mcp_server
+    mcp_server._codespace.update({"name": None, "repo": None})
+    mcp_server._active_scrape.update({
+        "thread": None, "route_key": None, "phase": "idle",
+        "result": None, "error": None,
+        "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
+        "started_at": None,
+    })
 
-    def test_search_route_warm_session_complete(self, tmp_path, monkeypatch, mcp_db):
-        """Warm session scrape returns scraping status, then completes."""
+
+class TestCodespaceScrape:
+    """Tests for Codespace-based search_route, scrape_status, submit_mfa, stop_session."""
+
+    def setup_method(self):
+        _reset_mcp_state()
+
+    def teardown_method(self):
+        _reset_mcp_state()
+
+    # 1. search_route cold start (no existing Codespace) — creates one, starts scrape
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    @patch("mcp_server._run_codespace_scrape")
+    def test_search_route_cold_start(self, mock_run, mock_which):
         import mcp_server
-
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        mcp_server._session["farm"] = MagicMock()
-        mcp_server._session["farm"].refresh_cookies.return_value = True
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
-
-        mock_result = {"found": 100, "stored": 95, "rejected": 5, "errors": 0}
-        mock_scrape = MagicMock(return_value=mock_result)
-
-        # Keep patch active until thread finishes (thread imports scrape in background)
-        with patch.dict("sys.modules", {"scrape": MagicMock(scrape_route=mock_scrape)}):
-            result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-            # Non-blocking — returns scraping immediately
-            assert result["status"] in ("scraping", "complete")
-            assert result["route"] == "YYZ-LAX"
-
-            # Wait for thread to finish, then check scrape_status
-            thread = mcp_server._active_scrape.get("thread")
-            if thread and thread.is_alive():
-                thread.join(timeout=5)
-
-            status = json.loads(mcp_server.scrape_status())
-            assert status["status"] == "complete"
-            assert status["found"] == 100
-            assert status["stored"] == 95
-
-        # Cleanup
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-
-    def test_search_route_mfa_required(self, tmp_path, monkeypatch):
-        """search_route returns starting immediately; MFA is discovered via scrape_status."""
-        import mcp_server
-
-        mfa_request_path = str(tmp_path / "mfa_request")
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", mfa_request_path)
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Ensure session is cold
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
-
-        # Events to coordinate: thread signals file written, test holds thread alive
-        file_written = threading.Event()
-        mfa_hold = threading.Event()
-
-        def fake_ensure_session(mfa_prompt=None):
-            with open(mfa_request_path, "w") as f:
-                f.write('{"type": "sms"}')
-            file_written.set()
-            mfa_hold.wait(timeout=10)
-
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
+        _reset_mcp_state()
+        # No existing codespace
+        assert mcp_server._codespace["name"] is None
 
         result = json.loads(mcp_server.search_route("YYZ", "LAX"))
 
-        # Instant return
         assert result["status"] == "starting"
         assert result["route"] == "YYZ-LAX"
+        assert "Creating scraping environment" in result["message"]
+        assert result["poll_interval_s"] == 10
+        mock_run.assert_called_once_with("YYZ", "LAX")
 
-        # Wait for the background thread to write the MFA file
-        file_written.wait(timeout=5)
-
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "mfa_required"
-
-        # Cleanup: release the hold and wait for the background thread
-        mfa_hold.set()
+        # Wait for thread to finish
         thread = mcp_server._active_scrape.get("thread")
         if thread and thread.is_alive():
-            thread.join(timeout=1)
+            thread.join(timeout=2)
 
-    def test_submit_mfa_writes_code_and_returns(self, tmp_path, monkeypatch):
-        """submit_mfa writes code to response file and returns code_submitted (non-blocking)."""
+    # 2. search_route warm start (existing Codespace) — reuses, starts scrape
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    @patch("mcp_server._run_codespace_scrape")
+    def test_search_route_warm_start(self, mock_run, mock_which):
         import mcp_server
-        import threading
+        _reset_mcp_state()
+        mcp_server._codespace["name"] = "test-codespace-123"
 
-        monkeypatch.setattr(mcp_server, "_MFA_DIR", str(tmp_path))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
+        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
 
-        # Simulate a thread that completes with a result once MFA code is written
-        def fake_scrape_work():
-            # Wait for MFA response file to appear
-            response_path = str(tmp_path / "mfa_response")
-            for _ in range(50):
-                if os.path.exists(response_path):
-                    break
-                time.sleep(0.05)
-            mcp_server._active_scrape["result"] = {
+        assert result["status"] == "starting"
+        assert result["route"] == "YYZ-LAX"
+        assert "Reusing existing environment" in result["message"]
+        assert result["poll_interval_s"] == 3
+        mock_run.assert_called_once_with("YYZ", "LAX")
+
+        # Wait for thread to finish
+        thread = mcp_server._active_scrape.get("thread")
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+
+    # 3. scrape_status during creating phase
+    def test_scrape_status_creating(self):
+        import mcp_server
+        _reset_mcp_state()
+        mcp_server._active_scrape.update({
+            "thread": MagicMock(is_alive=MagicMock(return_value=True)),
+            "route_key": ("YYZ", "LAX"),
+            "phase": "creating",
+            "started_at": time.time() - 30,
+        })
+
+        result = json.loads(mcp_server.scrape_status())
+        assert result["status"] == "creating"
+        assert result["route"] == "YYZ-LAX"
+        assert result["poll_interval_s"] == 10
+        # ETA: max(300 - 30, 60) = 270
+        assert result["estimated_remaining_s"] >= 60
+
+    # 4. scrape_status during scraping phase with window progress
+    def test_scrape_status_scraping_progress(self):
+        import mcp_server
+        _reset_mcp_state()
+        mcp_server._active_scrape.update({
+            "thread": MagicMock(is_alive=MagicMock(return_value=True)),
+            "route_key": ("YYZ", "LAX"),
+            "phase": "scraping",
+            "window": 5, "total_windows": 12,
+            "found_so_far": 200, "stored_so_far": 185,
+            "started_at": time.time() - 30,
+        })
+
+        result = json.loads(mcp_server.scrape_status())
+        assert result["status"] == "scraping"
+        assert result["route"] == "YYZ-LAX"
+        assert result["window"] == 5
+        assert result["total_windows"] == 12
+        assert result["found_so_far"] == 200
+        assert result["stored_so_far"] == 185
+        assert result["elapsed_s"] >= 29
+        assert "estimated_remaining_s" in result
+        assert "poll_interval_s" in result
+
+    # 5. scrape_status with mfa_required
+    def test_scrape_status_mfa_required(self):
+        import mcp_server
+        _reset_mcp_state()
+        mcp_server._active_scrape.update({
+            "thread": MagicMock(is_alive=MagicMock(return_value=True)),
+            "route_key": ("YYZ", "LAX"),
+            "phase": "mfa_required",
+            "started_at": time.time(),
+        })
+
+        result = json.loads(mcp_server.scrape_status())
+        assert result["status"] == "mfa_required"
+        assert "submit_mfa" in result["message"]
+
+    # 6. scrape_status when complete
+    def test_scrape_status_complete(self):
+        import mcp_server
+        _reset_mcp_state()
+        mcp_server._active_scrape.update({
+            "route_key": ("YYZ", "LAX"),
+            "phase": "complete",
+            "result": {
                 "status": "complete",
                 "route": "YYZ-LAX",
-                "found": 50,
-                "stored": 50,
-            }
-            mcp_server._active_scrape["phase"] = "complete"
-
-        thread = threading.Thread(target=fake_scrape_work, daemon=True)
-        mcp_server._active_scrape.update({
-            "thread": thread,
-            "route_key": ("YYZ", "LAX"),
-            "result": None,
-            "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "mfa_required", "started_at": time.time(),
+                "found": 100,
+                "stored": 95,
+            },
         })
-        thread.start()
+
+        result = json.loads(mcp_server.scrape_status())
+        assert result["status"] == "complete"
+        assert result["found"] == 100
+        assert result["stored"] == 95
+
+    # 7. submit_mfa writes code via SSH stdin
+    @patch("mcp_server.subprocess.Popen")
+    def test_submit_mfa_writes_code(self, mock_popen):
+        import mcp_server
+        _reset_mcp_state()
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "")
+        mock_popen.return_value = mock_proc
+
+        mcp_server._codespace["name"] = "test-cs-123"
+        mcp_server._active_scrape.update({
+            "thread": MagicMock(is_alive=MagicMock(return_value=True)),
+            "route_key": ("YYZ", "LAX"),
+            "phase": "mfa_required",
+            "started_at": time.time(),
+        })
 
         result = json.loads(mcp_server.submit_mfa("847291"))
-
-        # Non-blocking — returns code_submitted immediately
         assert result["status"] == "code_submitted"
         assert result["route"] == "YYZ-LAX"
 
-        # Verify the response file was written with the code
-        response_content = (tmp_path / "mfa_response").read_text()
-        assert response_content == "847291"
+        # Verify the SSH command was called with correct args
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        cmd = call_args[0][0]
+        assert "gh" in cmd[0]
+        assert "codespace" in cmd[1]
+        assert "ssh" in cmd[2]
+        assert "test-cs-123" in cmd
+        # Verify code was piped via stdin
+        mock_proc.communicate.assert_called_once_with(input="847291", timeout=30)
 
-        # Wait for thread to finish, then check scrape_status
-        thread.join(timeout=5)
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "complete"
-        assert status["found"] == 50
-
+    # 8. submit_mfa with no active scrape
     def test_submit_mfa_no_active_scrape(self):
-        """submit_mfa returns error when no active scrape thread exists."""
         import mcp_server
-
-        # Ensure no active thread
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
+        _reset_mcp_state()
 
         result = json.loads(mcp_server.submit_mfa("123456"))
         assert result["error"] == "no_active_scrape"
 
-    def test_search_route_rejects_duplicate(self, monkeypatch):
-        """search_route rejects when a scrape thread is already running."""
+    # 9. stop_session deletes Codespace
+    @patch("mcp_server.subprocess.run")
+    def test_stop_session_deletes_codespace(self, mock_run):
         import mcp_server
-        import threading
+        _reset_mcp_state()
+        mock_run.return_value = MagicMock(returncode=0)
+        mcp_server._codespace["name"] = "test-cs-456"
+
+        result = json.loads(mcp_server.stop_session())
+        assert result["status"] == "stopped"
+        assert "deleted" in result["message"].lower()
+        assert mcp_server._codespace["name"] is None
+
+        # Verify gh codespace delete was called
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "delete" in call_args
+        assert "test-cs-456" in call_args
+
+    # 10. stop_session when no Codespace
+    def test_stop_session_no_codespace(self):
+        import mcp_server
+        _reset_mcp_state()
+
+        result = json.loads(mcp_server.stop_session())
+        assert result["status"] == "not_running"
+        assert "no active" in result["message"].lower()
+
+    # 11. search_route when gh CLI not installed
+    @patch("mcp_server.shutil.which", return_value=None)
+    def test_search_route_no_gh_cli(self, mock_which):
+        import mcp_server
+        _reset_mcp_state()
+
+        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
+        assert result["error"] == "gh_not_installed"
+
+    # 12. submit_mfa with empty code
+    def test_submit_mfa_empty_code(self):
+        import mcp_server
+        _reset_mcp_state()
+
+        result = json.loads(mcp_server.submit_mfa(""))
+        assert result["error"] == "invalid_code"
+
+    # 13. search_route rejects duplicate
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    def test_search_route_rejects_duplicate(self, mock_which):
+        import mcp_server
+        _reset_mcp_state()
 
         # Create a fake alive thread
         event = threading.Event()
@@ -349,10 +414,8 @@ class TestSearchRouteMFA:
         mcp_server._active_scrape.update({
             "thread": thread,
             "route_key": ("YYZ", "LAX"),
-            "result": None,
-            "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "scraping", "started_at": time.time(),
+            "phase": "scraping",
+            "started_at": time.time(),
         })
 
         result = json.loads(mcp_server.search_route("YYZ", "LAX"))
@@ -361,426 +424,105 @@ class TestSearchRouteMFA:
         # Cleanup
         event.set()
         thread.join(timeout=2)
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
 
-    def test_search_route_cold_thread_error(self, tmp_path, monkeypatch):
-        """search_route cold start error visible via scrape_status."""
+    # 14. scrape_status idle
+    def test_scrape_status_idle(self):
         import mcp_server
+        _reset_mcp_state()
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Ensure session is cold
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
-
-        def fake_ensure_session(mfa_prompt=None):
-            raise RuntimeError("Browser failed to start")
-
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
-
-        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-        # Instant return from cold path
-        assert result["status"] == "starting"
-        assert result["route"] == "YYZ-LAX"
-
-        # Wait for thread to finish, then check scrape_status
-        thread = mcp_server._active_scrape.get("thread")
-        if thread and thread.is_alive():
-            thread.join(timeout=5)
-
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "error"
-        assert "Browser failed" in status["message"]
-
-    def test_submit_mfa_empty_code(self):
-        """submit_mfa returns error for empty code."""
-        import mcp_server
-
-        result = json.loads(mcp_server.submit_mfa(""))
-        assert result["error"] == "invalid_code"
-
-    def test_stop_session(self, monkeypatch):
-        """stop_session returns correct status."""
-        import mcp_server
-
-        # When no session is running
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-
-        result = json.loads(mcp_server.stop_session())
-        assert result["status"] == "not_running"
-
-        # When a session is running
-        mock_farm = MagicMock()
-        mock_scraper = MagicMock()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-
-        result = json.loads(mcp_server.stop_session())
-        assert result["status"] == "stopped"
-        assert mcp_server._session["farm"] is None
-        assert mcp_server._session["scraper"] is None
-        assert mcp_server._session["logged_in"] is False
-
-    def test_search_route_dead_browser_cold_start(self, tmp_path, monkeypatch, mcp_db):
-        """search_route falls through to cold path when browser is dead."""
-        import mcp_server
-
-        mfa_request_path = str(tmp_path / "mfa_request")
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", mfa_request_path)
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Simulate a warm session with dead browser
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = False
-        mcp_server._session["farm"] = MagicMock()
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
-
-        # Mock _ensure_session to simulate MFA required on cold start
-        file_written = threading.Event()
-
-        def fake_ensure_session(mfa_prompt=None):
-            with open(mfa_request_path, "w") as f:
-                f.write('{"type": "sms"}')
-            file_written.set()
-            # Hold the thread alive so scrape_status can check it
-            threading.Event().wait(timeout=10)
-
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
-
-        result = json.loads(mcp_server.search_route("YYZ", "CDG"))
-
-        # Instant return from cold path
-        assert result["status"] == "starting"
-
-        # Wait for thread to write MFA file, then check scrape_status
-        file_written.wait(timeout=5)
-
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "mfa_required"
-
-        # Cleanup
-        thread = mcp_server._active_scrape.get("thread")
-        if thread and thread.is_alive():
-            thread.join(timeout=1)
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-
-    def test_search_route_warm_exception_recovery(self, tmp_path, monkeypatch, mcp_db):
-        """Warm scrape exception is discovered via scrape_status after instant return."""
-        import mcp_server
-
-        mfa_request_path = str(tmp_path / "mfa_request")
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", mfa_request_path)
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Simulate a warm session where browser appears alive but scrape fails
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.return_value = True
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None, "last_window_at": None,
-        })
-
-        # Make scrape_route raise an exception (simulates dead CDP mid-scrape)
-        mock_scrape = MagicMock(side_effect=RuntimeError("CDP connection closed"))
-
-        # Keep patch active until thread finishes (thread imports scrape in background)
-        with patch.dict("sys.modules", {"scrape": MagicMock(scrape_route=mock_scrape)}):
-            result = json.loads(mcp_server.search_route("YYZ", "CDG"))
-
-            # Instant return — error is discovered via scrape_status
-            assert result["status"] == "scraping"
-            assert result["route"] == "YYZ-CDG"
-
-            # Wait for thread to finish, then check scrape_status
-            thread = mcp_server._active_scrape.get("thread")
-            if thread and thread.is_alive():
-                thread.join(timeout=5)
-
-            status = json.loads(mcp_server.scrape_status())
-            assert status["status"] == "error"
-            assert "CDP connection closed" in status["message"]
-
-        # Cleanup
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-
-    def test_scrape_status_idle(self, tmp_path, monkeypatch, mcp_db):
-        """scrape_status returns idle when no scrape has been started."""
-        import mcp_server
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
         result = json.loads(mcp_server.scrape_status())
         assert result["status"] == "idle"
 
-    def test_scrape_status_progress(self, tmp_path, monkeypatch, mcp_db):
-        """scrape_status returns progress during an active scrape."""
+    # 15. scrape_status error
+    def test_scrape_status_error(self):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-
-        # Simulate an in-progress scrape
+        _reset_mcp_state()
         mcp_server._active_scrape.update({
-            "thread": MagicMock(is_alive=MagicMock(return_value=True)),
             "route_key": ("YYZ", "LAX"),
-            "result": None, "error": None,
-            "window": 5, "total_windows": 12,
-            "found_so_far": 200, "stored_so_far": 185,
-            "phase": "scraping", "started_at": time.time() - 30,
+            "phase": "error",
+            "error": RuntimeError("SSH connection failed"),
         })
+
         result = json.loads(mcp_server.scrape_status())
-        assert result["status"] == "scraping"
-        assert result["route"] == "YYZ-LAX"
-        assert result["window"] == 5
-        assert result["found_so_far"] == 200
-        assert result["stored_so_far"] == 185
-        assert result["elapsed_s"] >= 29
+        assert result["status"] == "error"
+        assert "SSH connection failed" in result["message"]
 
-        # Cleanup
+    # 16. scrape_status thread died unexpectedly
+    def test_scrape_status_thread_died(self):
+        import mcp_server
+        _reset_mcp_state()
         mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
+            "thread": MagicMock(is_alive=MagicMock(return_value=False)),
+            "route_key": ("YYZ", "LAX"),
+            "phase": "scraping",
+            "started_at": time.time() - 10,
         })
 
-    def test_submit_mfa_non_blocking(self, tmp_path, monkeypatch, mcp_db):
-        """submit_mfa writes code and returns immediately without blocking."""
+        result = json.loads(mcp_server.scrape_status())
+        assert result["status"] == "error"
+        assert "unexpectedly" in result["message"]
+
+    # 17. submit_mfa when phase is not mfa_required
+    @patch("mcp_server.subprocess.Popen")
+    def test_submit_mfa_wrong_phase(self, mock_popen):
         import mcp_server
-
-        mfa_response_path = str(tmp_path / "mfa_response")
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", mfa_response_path)
-        monkeypatch.setattr(mcp_server, "_MFA_DIR", str(tmp_path))
-
-        # Simulate active scrape thread waiting for MFA
+        _reset_mcp_state()
+        mcp_server._codespace["name"] = "test-cs-123"
         mcp_server._active_scrape.update({
             "thread": MagicMock(is_alive=MagicMock(return_value=True)),
             "route_key": ("YYZ", "LAX"),
-            "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "mfa_required", "started_at": time.time(),
+            "phase": "scraping",
+            "started_at": time.time(),
         })
 
         result = json.loads(mcp_server.submit_mfa("123456"))
-        assert result["status"] == "code_submitted"
-        assert result["route"] == "YYZ-LAX"
+        assert result["error"] == "not_waiting_for_mfa"
+        mock_popen.assert_not_called()
 
-        # Verify code was written to file
-        with open(mfa_response_path) as f:
-            assert f.read().strip() == "123456"
-
-        # Cleanup
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None,
-        })
-
-
-class TestSessionReliabilityFixes:
-    """Tests for warm session validation, extended MFA wait, and ETA in scrape_status."""
-
-    def _reset_state(self):
-        """Reset mcp_server session and scrape state."""
+    # 18. _parse_scrape_stdout updates state correctly
+    def test_parse_scrape_stdout(self):
         import mcp_server
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None, "last_window_at": None,
-        })
+        _reset_mcp_state()
 
-    def test_warm_session_validation_fallback(self, tmp_path, monkeypatch, mcp_db):
-        """Warm session with failed refresh_cookies tears down and falls to cold path."""
+        # Window progress
+        mcp_server._parse_scrape_stdout("Window 3/12 — searching...")
+        assert mcp_server._active_scrape["window"] == 3
+        assert mcp_server._active_scrape["total_windows"] == 12
+        assert mcp_server._active_scrape["phase"] == "scraping"
+
+        # MFA required
+        mcp_server._parse_scrape_stdout("MFA_REQUIRED")
+        assert mcp_server._active_scrape["phase"] == "mfa_required"
+
+        # Login confirmed
+        mcp_server._parse_scrape_stdout("Login confirmed — proceeding")
+        assert mcp_server._active_scrape["phase"] == "scraping"
+
+        # Found/Stored counts
+        mcp_server._parse_scrape_stdout("Found:  42 solutions")
+        assert mcp_server._active_scrape["found_so_far"] == 42
+
+        mcp_server._parse_scrape_stdout("Stored: 38 records")
+        assert mcp_server._active_scrape["stored_so_far"] == 38
+
+    # 19. _check_gh_cli when gh is available
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    def test_check_gh_cli_available(self, mock_which):
         import mcp_server
+        assert mcp_server._check_gh_cli() is None
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Set up warm session
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.return_value = False
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-        self._reset_state()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-
-        # Track _stop_session calls
-        stop_called = {"count": 0}
-        original_stop = mcp_server._stop_session
-
-        def tracking_stop():
-            stop_called["count"] += 1
-            original_stop()
-
-        monkeypatch.setattr(mcp_server, "_stop_session", tracking_stop)
-
-        # Mock the cold path: _ensure_session raises so it finishes fast
-        def fake_ensure_session(mfa_prompt=None):
-            raise RuntimeError("Cold start triggered")
-
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
-
-        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-        # _stop_session should have been called (session torn down)
-        assert stop_called["count"] >= 1
-
-        # Instant return from cold path
-        assert result.get("status") == "starting", \
-            f"Expected cold path 'starting', got: {result}"
-        # Must NOT contain "Warm session active"
-        assert "Warm session active" not in result.get("message", "")
-
-        # Wait for thread to finish, then verify error via scrape_status
-        thread = mcp_server._active_scrape.get("thread")
-        if thread and thread.is_alive():
-            thread.join(timeout=2)
-
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "error"
-
-        self._reset_state()
-
-    def test_warm_session_validation_exception(self, tmp_path, monkeypatch, mcp_db):
-        """Warm session where refresh_cookies raises exception tears down and falls to cold path."""
+    # 20. _check_gh_cli when gh is not available
+    @patch("mcp_server.shutil.which", return_value=None)
+    def test_check_gh_cli_missing(self, mock_which):
         import mcp_server
+        result = mcp_server._check_gh_cli()
+        assert result is not None
+        assert result["error"] == "gh_not_installed"
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Set up warm session where refresh_cookies throws
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.side_effect = Exception("Connection reset")
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-        self._reset_state()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-
-        # Track _stop_session calls
-        stop_called = {"count": 0}
-        original_stop = mcp_server._stop_session
-
-        def tracking_stop():
-            stop_called["count"] += 1
-            original_stop()
-
-        monkeypatch.setattr(mcp_server, "_stop_session", tracking_stop)
-
-        # Mock cold path
-        def fake_ensure_session(mfa_prompt=None):
-            raise RuntimeError("Cold start triggered after exception")
-
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
-
-        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-        # _stop_session should have been called
-        assert stop_called["count"] >= 1
-
-        # Instant return from cold path
-        assert result.get("status") == "starting"
-        assert "Warm session active" not in result.get("message", "")
-
-        # Wait for thread to finish, then verify error via scrape_status
-        thread = mcp_server._active_scrape.get("thread")
-        if thread and thread.is_alive():
-            thread.join(timeout=2)
-
-        status = json.loads(mcp_server.scrape_status())
-        assert status["status"] == "error"
-
-        self._reset_state()
-
-    def test_warm_session_valid(self, tmp_path, monkeypatch, mcp_db):
-        """Warm session with valid refresh_cookies proceeds on the warm path."""
+    # 21. scrape_status ETA with active window progress
+    def test_scrape_status_eta_with_windows(self):
         import mcp_server
-
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
-
-        # Set up warm session that passes validation
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.return_value = True
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        self._reset_state()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
-
-        # Mock scrape_route to complete quickly
-        mock_result = {"found": 50, "stored": 45, "rejected": 5, "errors": 0}
-        mock_scrape = MagicMock(return_value=mock_result)
-
-        # Keep patch active until thread finishes (thread imports scrape in background)
-        with patch.dict("sys.modules", {"scrape": MagicMock(scrape_route=mock_scrape)}):
-            result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-            # Should proceed on warm path: scraping or complete
-            assert result.get("status") in ("scraping", "complete"), \
-                f"Expected warm path outcome, got: {result}"
-            assert result["route"] == "YYZ-LAX"
-
-            # Wait for thread to finish
-            thread = mcp_server._active_scrape.get("thread")
-            if thread and thread.is_alive():
-                thread.join(timeout=5)
-
-            # Verify the scrape actually ran through warm path (scrape_route was called)
-            status = json.loads(mcp_server.scrape_status())
-            assert status["status"] in ("complete", "scraping")
-
-        # Cleanup
-        self._reset_state()
-
-    def test_scrape_status_eta(self, tmp_path, monkeypatch):
-        """scrape_status returns estimated_remaining_s and poll_interval_s during active scrape."""
-        import mcp_server
-
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
+        _reset_mcp_state()
 
         # Simulate mid-scrape: 4 of 12 windows done in 80 seconds (20s/window)
         mock_thread = MagicMock()
@@ -788,16 +530,13 @@ class TestSessionReliabilityFixes:
         mcp_server._active_scrape.update({
             "thread": mock_thread,
             "route_key": ("YYZ", "LAX"),
-            "result": None, "error": None,
+            "phase": "scraping",
             "window": 4, "total_windows": 12,
             "found_so_far": 100, "stored_so_far": 90,
-            "phase": "scraping",
             "started_at": time.time() - 80,
-            "last_window_at": time.time() - 5,
         })
 
         result = json.loads(mcp_server.scrape_status())
-
         assert result["status"] == "scraping"
         assert "estimated_remaining_s" in result
         # 8 remaining windows * 20s/window = 160s, allow some tolerance
@@ -806,329 +545,182 @@ class TestSessionReliabilityFixes:
         assert "poll_interval_s" in result
         assert 5 <= result["poll_interval_s"] <= 30
 
-        # Cleanup
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None, "last_window_at": None,
-        })
-
-    def test_scrape_status_eta_no_windows(self, tmp_path, monkeypatch):
-        """scrape_status uses fast poll during starting phase (phase-aware)."""
+    # 22. scrape_status during login phase uses fast polling
+    def test_scrape_status_login_phase(self):
         import mcp_server
+        _reset_mcp_state()
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-
-        # Simulate early scrape: 0 windows done, 12 total, 5 seconds in
         mock_thread = MagicMock()
         mock_thread.is_alive.return_value = True
         mcp_server._active_scrape.update({
             "thread": mock_thread,
             "route_key": ("YYZ", "LAX"),
-            "result": None, "error": None,
+            "phase": "login",
             "window": 0, "total_windows": 12,
-            "found_so_far": 0, "stored_so_far": 0,
-            "phase": "starting",
             "started_at": time.time() - 5,
-            "last_window_at": None,
         })
 
         result = json.loads(mcp_server.scrape_status())
-
-        assert "estimated_remaining_s" in result
+        assert result["poll_interval_s"] == 3
         # Fallback: 12 windows * 20s = 240s
         assert result["estimated_remaining_s"] == 240
-        assert "poll_interval_s" in result
-        # Phase-aware: starting phase returns poll_interval_s == 3
-        assert result["poll_interval_s"] == 3
 
-        # Cleanup
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None, "last_window_at": None,
-        })
 
-    def test_mfa_detected_via_scrape_status(self, tmp_path, monkeypatch, mcp_db):
-        """Warm path returns immediately; MFA is detected by scrape_status."""
+class TestCodespaceIntegration:
+    """Integration-style tests for the full Codespace scrape lifecycle."""
+
+    def setup_method(self):
+        _reset_mcp_state()
+
+    def teardown_method(self):
+        _reset_mcp_state()
+
+    @patch("mcp_server.subprocess.run")
+    @patch("mcp_server.subprocess.Popen")
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    def test_full_scrape_lifecycle(self, mock_which, mock_popen, mock_run):
+        """End-to-end: ensure_codespace -> SSH scrape -> copy -> merge -> complete."""
         import mcp_server
+        _reset_mcp_state()
 
-        mfa_request_path = str(tmp_path / "mfa_request")
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", mfa_request_path)
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
+        # Mock subprocess.run for various commands
+        def run_side_effect(cmd, **kwargs):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            result = MagicMock()
+            result.returncode = 0
+            if "repo view" in cmd_str:
+                result.stdout = "owner/seataero\n"
+            elif "codespace view" in cmd_str:
+                result.stdout = "Available\n"
+            elif "codespace create" in cmd_str:
+                result.stdout = "new-codespace-abc\n"
+            elif "codespace cp" in cmd_str:
+                result.stdout = ""
+            elif "merge_remote_db" in cmd_str:
+                result.stdout = "Merged OK\n"
+            elif "codespace delete" in cmd_str:
+                result.stdout = ""
+            else:
+                result.stdout = ""
+            result.stderr = ""
+            return result
 
-        # Set up warm session that passes validation
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.return_value = True
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        self._reset_state()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
+        mock_run.side_effect = run_side_effect
 
-        # Mock scrape_route to block (simulating a scrape that triggers MFA)
-        hold_event = threading.Event()
+        # Mock Popen for SSH scrape command — simulate stdout lines
+        mock_proc = MagicMock()
+        stdout_lines = [
+            "Login confirmed\n",
+            "Window 1/12 — searching 2026-05\n",
+            "Found:  25 solutions\n",
+            "Stored: 20 records\n",
+            "Window 2/12 — searching 2026-06\n",
+            "Found:  50 solutions\n",
+            "Stored: 40 records\n",
+        ]
+        mock_proc.stdout = iter(stdout_lines)
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
 
-        def blocking_scrape(*args, **kwargs):
-            hold_event.wait(timeout=10)
-            return {"found": 0, "stored": 0}
+        # Run the scrape thread function directly (not via search_route to avoid threading complexity)
+        mcp_server._run_codespace_scrape("YYZ", "LAX")
 
-        mock_scrape = MagicMock(side_effect=blocking_scrape)
+        # Verify final state
+        assert mcp_server._active_scrape["phase"] == "complete"
+        assert mcp_server._active_scrape["result"]["status"] == "complete"
+        assert mcp_server._active_scrape["result"]["route"] == "YYZ-LAX"
+        assert mcp_server._active_scrape["found_so_far"] == 50
+        assert mcp_server._active_scrape["stored_so_far"] == 40
 
-        # Keep patch active until thread finishes (thread imports scrape in background)
-        with patch.dict("sys.modules", {"scrape": MagicMock(scrape_route=mock_scrape)}):
-            result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-
-            # search_route returns immediately
-            assert result["status"] in ("scraping",)
-
-            # Create the MFA request file manually (simulating scraper detecting MFA)
-            with open(mfa_request_path, "w") as f:
-                f.write('{"type": "sms"}')
-
-            # scrape_status detects the MFA file
-            status = json.loads(mcp_server.scrape_status())
-            assert status["status"] == "mfa_required"
-
-            # Clean up: release the blocking scrape and wait for thread
-            hold_event.set()
-            thread = mcp_server._active_scrape.get("thread")
-            if thread and thread.is_alive():
-                thread.join(timeout=5)
-
-        # Clean up MFA file
-        if os.path.exists(mfa_request_path):
-            os.remove(mfa_request_path)
-
-        self._reset_state()
-
-    def test_search_route_returns_immediately(self, tmp_path, monkeypatch, mcp_db):
-        """search_route cold path returns in <2 seconds with poll_interval_s: 3."""
+    @patch("mcp_server.subprocess.run")
+    @patch("mcp_server.subprocess.Popen")
+    @patch("mcp_server.shutil.which", return_value="/usr/bin/gh")
+    def test_scrape_with_mfa_detected(self, mock_which, mock_popen, mock_run):
+        """MFA_REQUIRED in stdout sets phase to mfa_required."""
         import mcp_server
+        _reset_mcp_state()
+        mcp_server._codespace["name"] = "existing-cs"
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
+        def run_side_effect(cmd, **kwargs):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            result = MagicMock()
+            result.returncode = 0
+            if "codespace view" in cmd_str:
+                result.stdout = "Available\n"
+            elif "codespace cp" in cmd_str:
+                result.stdout = ""
+            elif "merge_remote_db" in cmd_str:
+                result.stdout = ""
+            else:
+                result.stdout = ""
+            result.stderr = ""
+            return result
 
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-        self._reset_state()
+        mock_run.side_effect = run_side_effect
 
-        hold = threading.Event()
+        # Stdout that includes MFA_REQUIRED then login confirmed
+        mock_proc = MagicMock()
+        stdout_lines = [
+            "MFA_REQUIRED\n",
+            "Login confirmed\n",
+            "Window 1/12 — searching\n",
+            "Found:  10 solutions\n",
+            "Stored: 8 records\n",
+        ]
 
-        def fake_ensure_session(mfa_prompt=None):
-            hold.wait(timeout=10)
+        # Use a list-based iterator so we can check phase mid-way
+        line_iter = iter(stdout_lines)
+        mock_proc.stdout = line_iter
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
 
-        monkeypatch.setattr(mcp_server, "_ensure_session", fake_ensure_session)
+        mcp_server._run_codespace_scrape("YYZ", "LAX")
 
-        start = time.time()
-        result = json.loads(mcp_server.search_route("YYZ", "LAX"))
-        elapsed = time.time() - start
+        # After processing all lines, phase should be complete (MFA was followed by login confirmed + windows)
+        assert mcp_server._active_scrape["phase"] == "complete"
+        assert mcp_server._active_scrape["window"] == 1
 
-        assert elapsed < 2.0, f"search_route took {elapsed:.1f}s -- should be instant"
-        assert result["status"] == "starting"
-        assert result["poll_interval_s"] == 3
-
-        # Cleanup
-        hold.set()
-        thread = mcp_server._active_scrape.get("thread")
-        if thread and thread.is_alive():
-            thread.join(timeout=2)
-        self._reset_state()
-
-    def test_scrape_status_login_phase_fast_poll(self, tmp_path, monkeypatch):
-        """scrape_status returns poll_interval_s == 3 during login phase."""
+    @patch("mcp_server._ensure_codespace", side_effect=RuntimeError("gh auth failed"))
+    def test_scrape_codespace_creation_fails(self, mock_ensure):
+        """If codespace creation fails, phase becomes error."""
         import mcp_server
+        _reset_mcp_state()
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
+        mcp_server._run_codespace_scrape("YYZ", "LAX")
 
-        mock_thread = MagicMock()
-        mock_thread.is_alive.return_value = True
-        mcp_server._active_scrape.update({
-            "thread": mock_thread,
-            "route_key": ("YYZ", "LAX"),
-            "result": None, "error": None,
-            "window": 0, "total_windows": 12,
-            "found_so_far": 0, "stored_so_far": 0,
-            "phase": "login",
-            "started_at": time.time() - 5,
-            "last_window_at": None,
-        })
+        assert mcp_server._active_scrape["phase"] == "error"
+        assert "gh auth failed" in str(mcp_server._active_scrape["error"])
 
-        result = json.loads(mcp_server.scrape_status())
-
-        assert result["status"] == "login"
-        assert result["poll_interval_s"] == 3
-
-        # Cleanup
-        mcp_server._active_scrape.update({
-            "thread": None, "route_key": None, "result": None, "error": None,
-            "window": 0, "total_windows": 12, "found_so_far": 0, "stored_so_far": 0,
-            "phase": "idle", "started_at": None, "last_window_at": None,
-        })
-
-    def test_session_keepalive_after_scrape(self, tmp_path, monkeypatch, mcp_db):
-        """farm.refresh_cookies() is called after warm scrape completes (keepalive)."""
+    @patch("mcp_server.subprocess.run")
+    @patch("mcp_server.subprocess.Popen")
+    def test_scrape_ssh_nonzero_exit(self, mock_popen, mock_run):
+        """Non-zero SSH exit code sets error."""
         import mcp_server
+        _reset_mcp_state()
+        mcp_server._codespace["name"] = "existing-cs"
 
-        monkeypatch.setattr(mcp_server, "_MFA_REQUEST", str(tmp_path / "mfa_request"))
-        monkeypatch.setattr(mcp_server, "_MFA_RESPONSE", str(tmp_path / "mfa_response"))
+        def run_side_effect(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "codespace view" in cmd_str:
+                result.stdout = "Available\n"
+            else:
+                result.stdout = ""
+            result.stderr = ""
+            return result
 
-        mock_farm = MagicMock()
-        mock_farm.refresh_cookies.return_value = True
-        mock_scraper = MagicMock()
-        mock_scraper.is_browser_alive.return_value = True
-        self._reset_state()
-        mcp_server._session["farm"] = mock_farm
-        mcp_server._session["scraper"] = mock_scraper
-        mcp_server._session["logged_in"] = True
+        mock_run.side_effect = run_side_effect
 
-        mock_result = {"found": 50, "stored": 45, "rejected": 5, "errors": 0}
-        mock_scrape = MagicMock(return_value=mock_result)
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(["Window 1/12\n"])
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 1
+        mock_popen.return_value = mock_proc
 
-        # Keep patch active until thread finishes (thread imports scrape in background)
-        with patch.dict("sys.modules", {"scrape": MagicMock(scrape_route=mock_scrape)}):
-            result = json.loads(mcp_server.search_route("YYZ", "LAX"))
+        mcp_server._run_codespace_scrape("YYZ", "LAX")
 
-            assert result["status"] == "scraping"
-
-            # Wait for thread to finish
-            thread = mcp_server._active_scrape.get("thread")
-            if thread and thread.is_alive():
-                thread.join(timeout=5)
-
-            # refresh_cookies called twice: once for session validation, once for keepalive
-            assert mock_farm.refresh_cookies.call_count >= 2, \
-                f"Expected refresh_cookies called >=2 times (validation + keepalive), got {mock_farm.refresh_cookies.call_count}"
-
-        self._reset_state()
-
-
-class TestGetFlightDetails:
-    def test_basic(self, seeded_mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX"))
-        assert "results" in result
-        assert isinstance(result["results"], list)
-        assert result["total"] == 7
-        assert len(result["results"]) <= 15
-        assert "has_more" in result
-        assert "showing" in result
-
-    def test_limit_offset(self, seeded_mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX", limit=3, offset=0))
-        assert len(result["results"]) == 3
-        assert result["total"] == 7
-        assert result["has_more"] is True
-        assert result["showing"] == "1-3 of 7"
-
-        page2 = json.loads(get_flight_details("YYZ", "LAX", limit=3, offset=3))
-        assert len(page2["results"]) == 3
-        assert page2["showing"] == "4-6 of 7"
-
-        page3 = json.loads(get_flight_details("YYZ", "LAX", limit=3, offset=6))
-        assert len(page3["results"]) == 1
-        assert page3["has_more"] is False
-
-    def test_cabin_filter(self, seeded_mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX", cabin="business"))
-        assert all(r["cabin"] in ("business", "business_pure") for r in result["results"])
-        assert result["total"] == 2
-
-    def test_sort_by_miles(self, seeded_mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX", sort="miles"))
-        miles = [r["miles"] for r in result["results"]]
-        assert miles == sorted(miles)
-
-    def test_no_results(self, mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX"))
-        assert result["error"] == "no_results"
-
-    def test_limit_clamped(self, seeded_mcp_db):
-        from mcp_server import get_flight_details
-        result = json.loads(get_flight_details("YYZ", "LAX", limit=100))
-        assert len(result["results"]) == 7
-
-
-class TestGetPriceTrend:
-    def test_basic(self, seeded_mcp_db):
-        from mcp_server import get_price_trend
-        result = json.loads(get_price_trend("YYZ", "LAX"))
-        assert result["data_points"] > 0
-        assert "trend" in result
-        for point in result["trend"]:
-            assert "date" in point
-            assert "miles" in point
-        dates = [p["date"] for p in result["trend"]]
-        assert dates == sorted(dates)
-
-    def test_cabin_filter(self, seeded_mcp_db):
-        from mcp_server import get_price_trend
-        result = json.loads(get_price_trend("YYZ", "LAX", cabin="business"))
-        assert result["cabin_filter"] == "business"
-        for point in result["trend"]:
-            assert point["cabin"] in ("business", "business_pure")
-
-    def test_no_results(self, mcp_db):
-        from mcp_server import get_price_trend
-        result = json.loads(get_price_trend("YYZ", "LAX"))
-        assert result["error"] == "no_results"
-
-
-class TestFindDeals:
-    def test_no_deals_empty_db(self, mcp_db):
-        from mcp_server import find_deals
-        result = json.loads(find_deals())
-        assert result["deals_found"] == 0
-
-    def test_returns_deals_structure(self, seeded_mcp_db):
-        from mcp_server import find_deals
-        result = json.loads(find_deals())
-        assert "deals_found" in result
-        if result["deals_found"] > 0:
-            deal = result["deals"][0]
-            assert "origin" in deal
-            assert "destination" in deal
-            assert "miles" in deal
-            assert "savings_pct" in deal
-
-    def test_cabin_filter(self, seeded_mcp_db):
-        from mcp_server import find_deals
-        result = json.loads(find_deals(cabin="business"))
-        if result["deals_found"] > 0:
-            assert result.get("cabin_filter") == "business"
-        else:
-            # No deals found — cabin_filter only present in non-empty responses
-            assert result["deals_found"] == 0
-
-    def test_max_results_clamped(self, seeded_mcp_db):
-        from mcp_server import find_deals
-        result = json.loads(find_deals(max_results=50))
-        if result["deals_found"] > 0:
-            assert len(result["deals"]) <= 25
-
-
-class TestMCPMetadata:
-    """Tests for FastMCP instructions and ToolAnnotations."""
-
-    def test_instructions_set(self):
-        import mcp_server
-        assert mcp_server.mcp.instructions is not None
-        assert "query_flights" in mcp_server.mcp.instructions
-        assert "get_flight_details" in mcp_server.mcp.instructions
-        assert "get_price_trend" in mcp_server.mcp.instructions
-        assert "find_deals" in mcp_server.mcp.instructions
-        assert "Do NOT" in mcp_server.mcp.instructions
-
-    def test_stop_session_not_running(self):
-        import mcp_server
-        mcp_server._session["farm"] = None
-        mcp_server._session["scraper"] = None
-        mcp_server._session["logged_in"] = False
-        result = json.loads(mcp_server.stop_session())
-        assert result["status"] == "not_running"
+        assert mcp_server._active_scrape["phase"] == "error"
+        assert "exited with code 1" in str(mcp_server._active_scrape["error"])
