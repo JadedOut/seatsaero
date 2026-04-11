@@ -49,6 +49,7 @@ class CookieFarm:
         self._context = None
         self._page = None
         self._lock = threading.Lock()
+        self._mfa_prompt = None  # stored callback for re-auth during session recovery
         self._load_credentials(env_file)
 
     # ------------------------------------------------------------------
@@ -67,8 +68,7 @@ class CookieFarm:
 
     def _has_auto_login_credentials(self) -> bool:
         """Return True if all auto-login credentials are configured."""
-        return all([self._united_email, self._united_password,
-                    self._gmail_address, self._gmail_app_password])
+        return all([self._united_email, self._united_password])
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -83,9 +83,16 @@ class CookieFarm:
         self._kill_orphaned_chrome()
         time.sleep(1)  # Allow OS to release file locks
         self._playwright = sync_playwright().start()
+        # United.com is behind Akamai Bot Manager which detects headless
+        # browsers via TLS/HTTP2 fingerprinting (ERR_HTTP2_PROTOCOL_ERROR).
+        # Always launch headed — headless is not viable against Akamai.
+        if self._headless:
+            print("WARNING: headless mode is not supported for united.com "
+                  "(Akamai bot detection). Launching headed instead.")
+            self._headless = False
         self._context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._user_data_dir),
-            headless=self._headless,
+            headless=False,
             channel="chrome",
             viewport={"width": 1280, "height": 800},
             args=["--disable-blink-features=AutomationControlled"],
@@ -156,7 +163,7 @@ class CookieFarm:
 
         # Re-launch
         self.start()
-        self.ensure_logged_in()
+        self.ensure_logged_in(mfa_prompt=self._mfa_prompt)
         print("Browser restarted successfully (re-authenticated)")
 
     def _kill_orphaned_chrome(self):
@@ -203,97 +210,125 @@ class CookieFarm:
     # Login
     # ------------------------------------------------------------------
 
-    def ensure_logged_in(self):
+    def ensure_logged_in(self, mfa_prompt=None):
         """Navigate to united.com and verify login state.
 
-        Tries auto-login first (if credentials are configured in .env),
-        then falls back to manual login if running headed.
+        Args:
+            mfa_prompt: Optional callable that returns the SMS verification
+                code as a string. When provided and MFA is required, this
+                callback is invoked to get the code from the user.
 
         Raises:
             RuntimeError: If headless and not logged in with no way to log in.
         """
+        # Persist callback so restart() and recovery paths can re-auth
+        if mfa_prompt is not None:
+            self._mfa_prompt = mfa_prompt
+
         with self._lock:
-            self._page.goto(
-                "https://www.united.com/en/ca/",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-            self._page.wait_for_timeout(3000)
+            current_url = self._page.url or ""
+            if "united.com" not in current_url:
+                self._page.goto(
+                    "https://www.united.com/en/ca/",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+
+            # Wait for SPA to resolve auth state — either the Sign in
+            # button appears (anonymous) or a logged-in indicator renders.
+            try:
+                self._page.wait_for_selector(
+                    'button:has-text("Sign in"):visible, '
+                    'a:has-text("Sign in"):visible, '
+                    'text="View My United", '
+                    'text="MILEAGEPLUS NUMBER"',
+                    timeout=10000,
+                )
+            except Exception:
+                # Timeout — page may be slow, proceed with detection anyway
+                pass
 
             if self._is_logged_in():
                 print("Already logged in")
                 return
 
-            # Try auto-login first
+            if not self._headless:
+                # Headed mode: try auto-login first
+                if self._has_auto_login_credentials():
+                    result = self._auto_login()
+                    if result == "success":
+                        return
+                    if result == "mfa_required":
+                        if mfa_prompt is not None:
+                            code = mfa_prompt()
+                            if self._enter_mfa_code(code):
+                                return
+                            print("MFA code failed — falling back to manual login")
+                        # Fall through to manual login
+                self._wait_for_login()
+                return
+
+            # Headless mode: must auto-login
             if self._has_auto_login_credentials():
-                if self._auto_login():
+                result = self._auto_login()
+                if result == "success":
                     return
-                print("Auto-login failed, falling back...")
+                if result == "mfa_required":
+                    if mfa_prompt is not None:
+                        code = mfa_prompt()
+                        if self._enter_mfa_code(code):
+                            return
+                        raise RuntimeError("MFA code was rejected")
+                    raise RuntimeError(
+                        "MFA required but no prompt callback provided. "
+                        "Pass mfa_prompt to ensure_logged_in() or run headed."
+                    )
+                print("Auto-login failed")
 
-            # Fall back to manual login
-            if self._headless:
-                raise RuntimeError(
-                    "Not logged in and running headless. "
-                    "Configure auto-login credentials in .env or run headed first."
-                )
-
-            self._wait_for_login()
+            raise RuntimeError(
+                "Not logged in and running headless. "
+                "Configure auto-login credentials in .env or run headed first."
+            )
 
     def _is_logged_in(self) -> bool:
-        """Check whether the current page shows a logged-in state.
+        """Check whether the current session is authenticated.
 
-        Uses multiple positive indicators rather than relying on the absence
-        of 'Sign in' (which can appear in hidden DOM elements even when
-        logged in).
+        Strategy: first prove we're NOT logged in (visible Sign in button),
+        then look for positive evidence of authentication (user-specific
+        DOM content that React only renders after login).
         """
         try:
-            content = self._page.content()
-            content_lower = content.lower()
-
-            # Positive indicators that the user IS logged in
-            logged_in_signals = [
-                "myaccount" in content_lower,
-                "mileageplus" in content_lower and "sign out" in content_lower,
-                "welcome" in content_lower and "mileageplus" in content_lower,
-                "sign out" in content_lower,
-                "my trips" in content_lower and "sign out" in content_lower,
-            ]
-            if any(logged_in_signals):
-                return True
-
-            # Check for the sign-in button being the primary visible CTA
-            # (not just hidden in DOM). If the visible page only has "Sign in"
-            # and none of the logged-in signals, we're not logged in.
+            # Negative signal: if the Sign in button is visible, we're
+            # definitely not logged in.  This catches fresh profiles and
+            # expired sessions quickly.
             try:
-                sign_in_btn = self._page.locator('button:has-text("Sign in"):visible')
+                sign_in_btn = self._page.locator(
+                    'button:has-text("Sign in"):visible, '
+                    'a:has-text("Sign in"):visible'
+                )
                 if sign_in_btn.count() > 0:
                     return False
             except Exception:
                 pass
 
-            # If we can't determine state confidently, check for bearer token
-            # as a definitive test — logged-in sessions have a valid token.
-            try:
-                token = self._page.evaluate(
-                    """async () => {
-                        try {
-                            const resp = await fetch('/api/auth/anonymous-token', {
-                                method: 'GET', credentials: 'same-origin',
-                            });
-                            if (resp.ok) {
-                                const data = await resp.json();
-                                return data?.data?.token?.hash || '';
-                            }
-                        } catch(e) {}
-                        return '';
-                    }"""
-                )
-                if token:
-                    return True
-            except Exception:
-                pass
-
-            return False
+            # Positive signals: user-specific content that React renders
+            # only after authentication.  These never appear for anonymous
+            # visitors (unlike "mileageplus" or "my trips" in the nav bar).
+            content = self._page.content().lower()
+            logged_in = any([
+                "mileageplus number:" in content,   # "MILEAGEPLUS NUMBER: MUH48117"
+                "view my united" in content,          # "View My United" button
+                "myaccount" in content,               # Account URL/link
+                "hi, " in content,                    # Greeting only rendered for logged-in users
+            ])
+            if logged_in:
+                try:
+                    cookies = self._context.cookies("https://www.united.com")
+                    names = sorted({c["name"] for c in cookies})
+                    print(f"  [DEBUG] Login confirmed. Cookies ({len(names)}): {names}")
+                except Exception:
+                    pass
+            return logged_in
         except Exception:
             return False
 
@@ -307,7 +342,7 @@ class CookieFarm:
             cookies = self._context.cookies("https://www.united.com")
             cookie_names = {c["name"] for c in cookies}
             # United sets these cookies after successful authentication
-            login_indicators = {"MileagePlusID", "uaLoginToken", "MP_AToken"}
+            login_indicators = {"MileagePlusID", "uaLoginToken", "MP_AToken", "AuthCookie", "User"}
             return bool(cookie_names & login_indicators)
         except Exception:
             return False
@@ -320,33 +355,20 @@ class CookieFarm:
         print("=" * 50)
         print("1. The browser is open at united.com")
         print("2. Click 'Sign in' and log in with your MileagePlus account")
-        print("3. Complete Gmail MFA when prompted")
+        print("3. Complete SMS MFA when prompted")
         print("4. Once logged in, this script will detect it automatically")
         print("=" * 50)
 
-        print("\nPolling for login (checking every 30s, timeout 30min)...")
+        print("\nPolling for login (checking every 10s, timeout 30min)...")
         deadline = time.time() + 1800  # 30 minutes
         while time.time() < deadline:
-            time.sleep(30)
-            if self._has_login_cookies():
-                break
+            time.sleep(10)
+            if self._is_logged_in():
+                print("Login confirmed!")
+                return
             print("  Still waiting for login...")
-        else:
-            print("ERROR: Login timed out after 30 minutes.")
-            return
 
-        # Confirm with a fresh navigation
-        self._page.goto(
-            "https://www.united.com/en/ca/",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        self._page.wait_for_timeout(3000)
-
-        if self._is_logged_in():
-            print("Login confirmed!")
-        else:
-            print("WARNING: Could not confirm login. Continuing anyway...")
+        print("ERROR: Login timed out after 30 minutes.")
 
     # ------------------------------------------------------------------
     # Auto-login
@@ -356,19 +378,19 @@ class CookieFarm:
         """Automate United login up to the MFA wall.
 
         Enters MileagePlus credentials (email + password) and clicks
-        Sign in. If no MFA is required, returns True. If MFA is
-        presented, returns False so the caller can hand off to the
-        manual _wait_for_login() flow.
+        Sign in.
 
         Must be called from within self._lock (called by ensure_logged_in).
 
         Returns:
-            True if login succeeded without MFA, False otherwise.
+            "success" if login succeeded without MFA,
+            "mfa_required" if an MFA/verification code screen is detected,
+            "failed" otherwise.
         """
         if not self._has_auto_login_credentials():
             print("Auto-login credentials not configured in .env")
-            print("Required: UNITED_EMAIL, UNITED_PASSWORD, GMAIL_ADDRESS, GMAIL_APP_PASSWORD")
-            return False
+            print("Required: UNITED_EMAIL, UNITED_PASSWORD")
+            return "failed"
 
         print("Attempting auto-login...")
         page = self._page
@@ -385,7 +407,7 @@ class CookieFarm:
             print("  Step 1: Clicked Sign in")
         except Exception as e:
             print(f"  Step 1 FAILED: {e}")
-            return False
+            return "failed"
 
         # Step 2: Enter email/MileagePlus number
         # The sign-in panel is a slide-out on the right side of the page.
@@ -445,11 +467,11 @@ class CookieFarm:
                     continue
                 else:
                     print(f"  Step 2 FAILED: {e}")
-                    return False
+                    return "failed"
 
         if not password_visible:
             print("  Step 2 FAILED: Could not get past email step after 3 attempts")
-            return False
+            return "failed"
 
         # Step 3: Enter password
         # Password input has id="password" inside the sign-in drawer.
@@ -480,16 +502,111 @@ class CookieFarm:
             print("  Step 3: Clicked Sign in")
         except Exception as e:
             print(f"  Step 3 FAILED: {e}")
-            return False
+            return "failed"
 
         # Check if we're already logged in (no MFA required)
         if self._is_logged_in():
             print("  Auto-login successful (no MFA required)!")
-            return True
+            return "success"
 
-        # MFA required — hand off to manual flow (_wait_for_login with cookie polling)
-        print("  MFA required — complete it manually in the browser")
-        return False
+        # Check for MFA/verification code input
+        try:
+            page = self._page
+            content = page.content().lower()
+            # Look for verification code indicators
+            has_mfa = any([
+                "verification code" in content,
+                "security code" in content,
+                "enter code" in content,
+                "enter your code" in content,
+            ])
+            if not has_mfa:
+                # Also check for a numeric code input field
+                code_input = page.locator('input[type="tel"], input[autocomplete="one-time-code"], input[inputmode="numeric"]')
+                if code_input.count() > 0:
+                    has_mfa = True
+            if has_mfa:
+                print("  MFA/verification code screen detected")
+                return "mfa_required"
+        except Exception:
+            pass
+
+        print("  Login did not complete — unknown state")
+        return "failed"
+
+    def _enter_mfa_code(self, code: str) -> bool:
+        """Fill the MFA verification code and submit.
+
+        Must be called after _auto_login() returns "mfa_required" and
+        within self._lock (called from ensure_logged_in).
+
+        Returns:
+            True if login succeeded after entering the code.
+        """
+        page = self._page
+        try:
+            # Find the code input field
+            code_input = page.locator(
+                'input[type="tel"], input[autocomplete="one-time-code"], input[inputmode="numeric"]'
+            ).first
+            code_input.wait_for(state="visible", timeout=5000)
+            code_input.fill(code)
+            page.wait_for_timeout(1000)
+            print("  MFA: Entered verification code")
+
+            # Find and click the submit/verify button
+            page.evaluate("""() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = btn.textContent.trim().toLowerCase();
+                    if (['verify', 'submit', 'continue', 'confirm'].some(k => text.includes(k))) {
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.width > 50 && rect.height > 20) {
+                            btn.click();
+                            return;
+                        }
+                    }
+                }
+            }""")
+            page.wait_for_timeout(5000)
+            print("  MFA: Clicked submit, waiting for page to settle...")
+
+            # United's SPA does NOT redirect after MFA — it stays on the
+            # verification page.  Navigate to the homepage so that
+            # _is_logged_in() can see the authenticated DOM state.
+            page.goto(
+                "https://www.united.com/en/ca/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            # Wait for SPA to resolve auth state
+            try:
+                page.wait_for_selector(
+                    'button:has-text("Sign in"):visible, '
+                    'a:has-text("Sign in"):visible, '
+                    'text="View My United", '
+                    'text="MILEAGEPLUS NUMBER"',
+                    timeout=10000,
+                )
+            except Exception:
+                pass
+
+            if self._is_logged_in():
+                print("  MFA: Login confirmed!")
+                return True
+
+            # Retry once — SPA hydration can be slow
+            page.wait_for_timeout(3000)
+            if self._is_logged_in():
+                print("  MFA: Login confirmed!")
+                return True
+
+            print("  MFA: Login not confirmed after code entry")
+            return False
+        except Exception as e:
+            print(f"  MFA: Failed to enter code — {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Cookie / token export
@@ -631,10 +748,10 @@ class CookieFarm:
     # ------------------------------------------------------------------
 
     def refresh_cookies(self) -> bool:
-        """Navigate to united.com to trigger Akamai JS sensor refresh.
+        """Reload the current page to trigger Akamai JS sensor refresh.
 
-        Waits 2s after DOM load for Akamai's sensor JS to execute and
-        post results (typically completes in 1-2s).
+        Uses reload() instead of goto() to preserve client-side auth state.
+        Waits 2s after DOM load for Akamai's sensor JS to execute.
 
         Automatically restarts the browser if it has crashed.
 
@@ -644,14 +761,18 @@ class CookieFarm:
         try:
             with self._lock:
                 start = time.time()
-                self._page.goto(
-                    "https://www.united.com/en/ca/",
+                self._page.reload(
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
                 self._page.wait_for_timeout(2000)
                 elapsed = time.time() - start
-                logged_in = self._is_logged_in()
+                # Cookie-first: auth cookies in jar = session valid
+                if self._has_login_cookies():
+                    logged_in = True
+                else:
+                    # Cookies missing — fall back to DOM check
+                    logged_in = self._is_logged_in()
         except Exception as exc:
             msg = str(exc).lower()
             if any(kw in msg for kw in ("closed", "target", "disposed", "disconnected", "crashed", "terminated")):
@@ -661,14 +782,18 @@ class CookieFarm:
                 try:
                     with self._lock:
                         start = time.time()
-                        self._page.goto(
-                            "https://www.united.com/en/ca/",
+                        self._page.reload(
                             wait_until="domcontentloaded",
                             timeout=30000,
                         )
                         self._page.wait_for_timeout(2000)
                         elapsed = time.time() - start
-                        logged_in = self._is_logged_in()
+                        # Cookie-first: auth cookies in jar = session valid
+                        if self._has_login_cookies():
+                            logged_in = True
+                        else:
+                            # Cookies missing — fall back to DOM check
+                            logged_in = self._is_logged_in()
                 except Exception:
                     print("Cookie refresh failed even after browser restart")
                     return False
@@ -678,5 +803,5 @@ class CookieFarm:
         if logged_in:
             print(f"Cookies refreshed ({elapsed:.1f}s)")
         else:
-            print("WARNING: Session expired during cookie refresh")
+            print("WARNING: Cookies AND DOM both indicate session expired")
         return logged_in

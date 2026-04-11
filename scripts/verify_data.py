@@ -177,9 +177,9 @@ def main():
         help="Origin and destination IATA codes (e.g., --route EWR LHR)",
     )
     parser.add_argument(
-        "--database-url",
+        "--db-path",
         default=None,
-        help="PostgreSQL connection URL (overrides DATABASE_URL env var)",
+        help="Path to SQLite database file (overrides SEATAERO_DB env var)",
     )
     parser.add_argument(
         "--stats",
@@ -194,13 +194,13 @@ def main():
 
     conn = None
     try:
-        conn = db.get_connection(args.database_url)
+        conn = db.get_connection(args.db_path)
     except Exception as e:
         print(f"Error: Could not connect to the database.", file=sys.stderr)
         print(f"Details: {e}", file=sys.stderr)
         print(file=sys.stderr)
-        print("Hint: Make sure PostgreSQL is running and DATABASE_URL or", file=sys.stderr)
-        print("--database-url is set correctly.", file=sys.stderr)
+        print("Hint: Check that the database file exists at the given path", file=sys.stderr)
+        print("or that SEATAERO_DB is set correctly.", file=sys.stderr)
         sys.exit(1)
 
     try:

@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta
 
 from curl_cffi.requests import Session
+from curl_cffi import CurlHttpVersion
 
 from cookie_farm import CookieFarm
 import united_api
@@ -54,7 +55,8 @@ class HybridScraper:
     _BACKOFF_MULTIPLIER = 2.0
 
     def __init__(self, cookie_farm: CookieFarm, refresh_interval: int = 2,
-                 session_budget: int = 30, session_pause: int = 60):
+                 session_budget: int = 30, session_pause: int = 60,
+                 http_version: str = "h2"):
         """
         Args:
             cookie_farm: CookieFarm instance (must already be started).
@@ -63,10 +65,12 @@ class HybridScraper:
             session_budget: Max requests before forcing a session reset pause
                 (default 30).
             session_pause: Seconds to pause on session budget reset (default 60).
+            http_version: "h2" for HTTP/2 (default) or "h1" for HTTP/1.1.
         """
         self._farm = cookie_farm
         self._refresh_interval = refresh_interval
         self._session_pause_seconds = session_pause
+        self._http_version = CurlHttpVersion.V1_1 if http_version == "h1" else CurlHttpVersion.NONE
         self._session: Session | None = None
         self._bearer_token: str = ""
         self._cookies: str = ""
@@ -82,7 +86,7 @@ class HybridScraper:
 
     def start(self):
         """Create curl_cffi session and pull initial cookies/token from the farm."""
-        self._session = Session(impersonate="chrome142")
+        self._session = Session(impersonate="chrome142", http_version=self._http_version)
         self._cookies = self._farm.get_cookies()
         self._bearer_token = self._farm.get_bearer_token()
         self._calls_since_refresh = 0
@@ -160,21 +164,21 @@ class HybridScraper:
                 self._calls_since_refresh = 0
                 if reset_session and self._session:
                     self._session.close()
-                    self._session = Session(impersonate="chrome142")
+                    self._session = Session(impersonate="chrome142", http_version=self._http_version)
                     print("  Session reset (new HTTP/2 connection)")
                 return
 
             still_logged_in = self._farm.refresh_cookies()
             if not still_logged_in:
-                print("  Session expired during refresh — re-authenticating...")
-                self._farm.ensure_logged_in()
+                print("  WARNING: refresh_cookies() returned False — continuing with existing cookies")
+                print("  (Next API call will detect if session is truly expired)")
             self._cookies = self._farm.get_cookies()
             self._bearer_token = self._farm.get_bearer_token()
             self._calls_since_refresh = 0
 
             if reset_session and self._session:
                 self._session.close()
-                self._session = Session(impersonate="chrome142")
+                self._session = Session(impersonate="chrome142", http_version=self._http_version)
                 print("  Session reset (new HTTP/2 connection)")
         except Exception as exc:
             print(f"  Refresh failed ({exc}) — restarting browser for recovery...")
@@ -185,7 +189,7 @@ class HybridScraper:
             self._calls_since_refresh = 0
             if reset_session and self._session:
                 self._session.close()
-                self._session = Session(impersonate="chrome142")
+                self._session = Session(impersonate="chrome142", http_version=self._http_version)
                 print("  Session reset (new HTTP/2 connection)")
 
     @staticmethod
@@ -271,9 +275,7 @@ class HybridScraper:
         # --- Cookie burn detection and retry ---
         if not result["success"] and self._is_cookie_burn(result.get("_exception"), result.get("_response")):
             self._consecutive_burns += 1
-            self._backoff_seconds = min(self._backoff_seconds * self._BACKOFF_MULTIPLIER, self._MAX_BACKOFF)
-            print(f"  Cookie burn detected, backing off {self._backoff_seconds:.0f}s + resetting session...")
-            time.sleep(self._backoff_seconds)
+            print(f"  Cookie burn detected, refreshing session...")
             self._refresh(reset_session=True)
             cookie_refreshed = True
 
@@ -326,6 +328,14 @@ class HybridScraper:
                 "_exception": exc,
                 "_response": None,
             }
+
+        # Log key response headers for diagnostics
+        _DIAG_HEADERS = ("server", "cf-ray", "cf-cache-status", "x-cache",
+                         "x-akamai-session-info", "x-served-by",
+                         "retry-after", "content-type")
+        diag = {h: response.headers.get(h) for h in _DIAG_HEADERS if response.headers.get(h)}
+        if diag:
+            print(f"    Headers: {diag}")
 
         # Validate
         is_valid, error_type, details = united_api.validate_response(response)

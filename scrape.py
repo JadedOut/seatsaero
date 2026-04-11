@@ -10,10 +10,8 @@ Usage:
 """
 
 import argparse
-import io
 import os
 import random
-import re
 import sys
 import time
 from datetime import datetime, date, timedelta
@@ -34,8 +32,8 @@ import united_api
 # ---------------------------------------------------------------------------
 
 
-def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.0) -> dict:
-    """Scrape 12 calendar windows for a single route and store results.
+def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.0, verbose: bool = True, start_window: int = 1, max_windows: int = 12, progress_cb=None) -> dict:
+    """Scrape calendar windows for a single route and store results.
 
     Generates departure dates spaced 30 days apart (today, today+30, ...,
     today+330) and fetches award calendar data for each window.
@@ -43,20 +41,26 @@ def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.
     Args:
         origin: 3-letter IATA origin code.
         destination: 3-letter IATA destination code.
-        conn: psycopg database connection.
+        conn: SQLite database connection.
         scraper: HybridScraper instance (must already be started).
         delay: Seconds to wait between API calls.
+        verbose: If True, print progress to stdout. Default True for
+            backwards compatibility.
+        start_window: 1-indexed window to start from (default: 1).
+        max_windows: Maximum number of windows to scrape (default: 12).
 
     Returns:
-        Dict with totals: found, stored, rejected, errors.
+        Dict with totals: found, stored, rejected, errors, total_windows.
     """
     today = date.today()
     depart_dates = [(today + timedelta(days=30 * i)).strftime("%Y-%m-%d") for i in range(12)]
+    depart_dates = depart_dates[start_window - 1 : start_window - 1 + max_windows]
 
     total_found = 0
     total_stored = 0
     total_rejected = 0
     total_errors = 0
+    error_messages = []
 
     for i, depart_date in enumerate(depart_dates):
         try:
@@ -85,21 +89,34 @@ def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.
                     "completed", found, stored, rejected,
                 )
 
-                print(f"  Window {i+1}/12 ({depart_date}): {found} solutions, {stored} stored, {rejected} rejected")
+                if progress_cb:
+                    progress_cb(window=start_window + i, total=12,
+                                found=total_found, stored=total_stored)
+
+                if verbose:
+                    print(f"  Window {start_window + i}/12 ({depart_date}): {found} solutions, {stored} stored, {rejected} rejected")
             else:
                 total_errors += 1
                 error_msg = result.get("error", "Unknown error")
+                error_messages.append(error_msg)
 
                 db.record_scrape_job(
                     conn, origin, destination, depart_date,
                     "failed", error=error_msg,
                 )
 
-                print(f"  Window {i+1}/12 ({depart_date}): FAILED — {error_msg}")
+                if progress_cb:
+                    progress_cb(window=start_window + i, total=12,
+                                found=total_found, stored=total_stored)
+
+                if verbose:
+                    print(f"  Window {start_window + i}/12 ({depart_date}): FAILED — {error_msg}")
 
         except Exception as exc:
             total_errors += 1
-            print(f"  Window {i+1}/12 ({depart_date}): ERROR — {exc}")
+            error_messages.append(str(exc))
+            if verbose:
+                print(f"  Window {start_window + i}/12 ({depart_date}): ERROR — {exc}")
 
             try:
                 db.record_scrape_job(
@@ -109,9 +126,14 @@ def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.
             except Exception:
                 pass
 
+            if progress_cb:
+                progress_cb(window=start_window + i, total=12,
+                            found=total_found, stored=total_stored)
+
         # Circuit breaker: abort route if scraper is consistently blocked
         if scraper.consecutive_burns >= 3:
-            print(f"  Circuit breaker triggered — {scraper.consecutive_burns} consecutive burns, aborting route")
+            if verbose:
+                print(f"  Circuit breaker triggered — {scraper.consecutive_burns} consecutive burns, aborting route")
             break
 
         # Delay between windows (skip after last)
@@ -125,18 +147,15 @@ def scrape_route(origin: str, destination: str, conn, scraper, delay: float = 7.
         "stored": total_stored,
         "rejected": total_rejected,
         "errors": total_errors,
+        "total_windows": len(depart_dates),
         "circuit_break": scraper.consecutive_burns >= 3,
+        "error_messages": error_messages,
     }
 
 
 # ---------------------------------------------------------------------------
 # Crash detection wrapper
 # ---------------------------------------------------------------------------
-
-# Pattern to capture per-window FAILED/ERROR lines printed by scrape_route().
-_WINDOW_ERROR_RE = re.compile(
-    r"Window\s+(\d+)/12\s+\([^)]+\):\s+(?:FAILED|ERROR)\s*[—-]\s*(.*)",
-)
 
 # Keywords that indicate a browser-level crash (vs. normal API errors)
 _BROWSER_CRASH_KEYWORDS = [
@@ -148,44 +167,29 @@ _BROWSER_CRASH_KEYWORDS = [
 ]
 
 
-def _scrape_with_crash_detection(origin, destination, conn, scraper, delay=7.0):
-    """Run scrape_route() while capturing stdout to detect browser crashes.
+def detect_browser_crash(totals: dict) -> bool:
+    """Check if scrape_route() results indicate a browser-level crash.
+
+    Returns True when all windows errored AND any error message
+    contains a browser crash keyword (e.g. 'browser has been closed').
+    """
+    if totals.get("errors") != totals.get("total_windows", 12):
+        return False
+    error_msgs = totals.get("error_messages", [])
+    if not error_msgs:
+        return False
+    all_text = " ".join(error_msgs).lower()
+    return any(kw in all_text for kw in _BROWSER_CRASH_KEYWORDS)
+
+
+def _scrape_with_crash_detection(origin, destination, conn, scraper, delay=7.0, verbose=True, start_window=1, max_windows=12):
+    """Run scrape_route() and detect browser crashes from structured error data.
 
     Returns:
         (totals_dict, browser_crashed_bool)
     """
-    old_stdout = sys.stdout
-    capture = io.StringIO()
-
-    class Tee:
-        def __init__(self, real, buffer):
-            self._real = real
-            self._buffer = buffer
-
-        def write(self, data):
-            self._real.write(data)
-            self._buffer.write(data)
-
-        def flush(self):
-            self._real.flush()
-
-    sys.stdout = Tee(old_stdout, capture)
-    try:
-        totals = scrape_route(origin, destination, conn, scraper, delay=delay)
-    finally:
-        sys.stdout = old_stdout
-
-    captured = capture.getvalue()
-
-    # Count error windows and check for browser crash keywords
-    error_lines = _WINDOW_ERROR_RE.findall(captured)
-    if totals["errors"] == 12 and error_lines:
-        all_error_text = " ".join(msg for _, msg in error_lines).lower()
-        browser_crashed = any(kw in all_error_text for kw in _BROWSER_CRASH_KEYWORDS)
-    else:
-        browser_crashed = False
-
-    return totals, browser_crashed
+    totals = scrape_route(origin, destination, conn, scraper, delay=delay, verbose=verbose, start_window=start_window, max_windows=max_windows)
+    return totals, detect_browser_crash(totals)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Seataero award availability scraper. "
             "Fetches United award calendar data and stores validated "
-            "results in PostgreSQL."
+            "results in the database."
         ),
     )
     parser.add_argument(
@@ -232,15 +236,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refresh cookies every N calls (default: 2)",
     )
     parser.add_argument(
-        "--database-url",
+        "--db-path",
         type=str,
         default=None,
-        help="PostgreSQL connection string (overrides DATABASE_URL env var)",
+        help="Path to SQLite database file (overrides SEATAERO_DB env var)",
     )
     parser.add_argument(
         "--create-schema",
         action="store_true",
         help="Create/update database schema before scraping",
+    )
+    parser.add_argument(
+        "--start-window",
+        type=int,
+        default=1,
+        help="Start from window N (1-indexed, default: 1)",
+    )
+    parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=12,
+        help="Maximum windows to scrape per route (default: 12)",
+    )
+    parser.add_argument(
+        "--session-budget",
+        type=int,
+        default=30,
+        help="Reset curl session after N requests (default: 30)",
+    )
+    parser.add_argument(
+        "--session-pause",
+        type=int,
+        default=60,
+        help="Seconds to pause on session budget reset (default: 60)",
+    )
+    parser.add_argument(
+        "--http-version",
+        choices=["h1", "h2"],
+        default="h2",
+        help="HTTP version: h1 for HTTP/1.1, h2 for HTTP/2 (default: h2)",
+    )
+    parser.add_argument(
+        "--wait-login",
+        action="store_true",
+        help="Pause after opening browser so you can log in manually",
     )
     return parser
 
@@ -262,7 +301,7 @@ def main():
     print("Seataero Award Scraper")
     print(f"Time:              {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Route:             {origin} -> {destination}")
-    print(f"Windows:           12 (today through +330 days)")
+    print(f"Windows:           {args.start_window} to {min(args.start_window + args.max_windows - 1, 12)} of 12")
     print(f"Delay:             {args.delay}s between calls")
     print(f"Refresh interval:  every {args.refresh_interval} calls")
     print(f"Headless:          {args.headless}")
@@ -270,12 +309,12 @@ def main():
     print(f"Create schema:     {args.create_schema}")
     print("=" * 60)
 
-    # Connect to PostgreSQL
-    print("\nConnecting to PostgreSQL...")
+    # Connect to database
+    print("\nConnecting to database...")
     try:
-        conn = db.get_connection(args.database_url)
+        conn = db.get_connection(args.db_path)
     except Exception as exc:
-        print(f"Cannot connect to PostgreSQL. Run `docker compose up -d` first.")
+        print(f"Cannot connect to database. Check that the database file exists at the given path.")
         print(f"  Error: {exc}")
         sys.exit(1)
 
@@ -296,18 +335,28 @@ def main():
             sys.exit(1)
 
         try:
+            if args.wait_login:
+                farm._page.goto("https://www.united.com/en/us/", wait_until="domcontentloaded", timeout=30000)
+                wait = 45
+                print(f"\n>>> Log in to United in the browser. Waiting {wait}s...")
+                for remaining in range(wait, 0, -1):
+                    print(f"  {remaining}s remaining...", end="\r")
+                    time.sleep(1)
+                print("  Continuing...                ")
             farm.ensure_logged_in()
 
             # Start hybrid scraper
             print("\nStarting hybrid scraper...")
-            scraper = HybridScraper(farm, refresh_interval=args.refresh_interval)
+            scraper = HybridScraper(farm, refresh_interval=args.refresh_interval, session_budget=args.session_budget, session_pause=args.session_pause, http_version=args.http_version)
             scraper.start()
 
             try:
                 # Scrape the route
-                print(f"\nScraping {origin} -> {destination} (12 windows)...\n")
+                actual_windows = min(args.max_windows, 12 - args.start_window + 1)
+                print(f"\nScraping {origin} -> {destination} ({actual_windows} windows)...\n")
                 totals, browser_crashed = _scrape_with_crash_detection(
                     origin, destination, conn, scraper, delay=args.delay,
+                    start_window=args.start_window, max_windows=args.max_windows,
                 )
 
                 # If browser crashed, attempt one recovery + retry
@@ -318,9 +367,10 @@ def main():
                     # restart() now calls ensure_logged_in() automatically
                     scraper.start()
                     scraper.reset_backoff()
-                    print(f"\nRetrying {origin} -> {destination} (12 windows)...\n")
+                    print(f"\nRetrying {origin} -> {destination} ({actual_windows} windows)...\n")
                     totals, _ = _scrape_with_crash_detection(
                         origin, destination, conn, scraper, delay=args.delay,
+                        start_window=args.start_window, max_windows=args.max_windows,
                     )
 
                 # Final summary

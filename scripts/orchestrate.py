@@ -111,8 +111,8 @@ def build_worker_cmd(worker_id, routes_file, args):
         cmd.append("--headless")
     if worker_id == 1 and args.create_schema:
         cmd.append("--create-schema")
-    if args.database_url:
-        cmd.extend(["--database-url", args.database_url])
+    if args.db_path:
+        cmd.extend(["--db-path", args.db_path])
     cmd.append("--one-shot")
     cmd.extend(["--burn-limit", str(args.burn_limit)])
     return cmd
@@ -316,10 +316,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create/update DB schema (only first worker gets this flag)",
     )
     parser.add_argument(
-        "--database-url",
+        "--db-path",
         type=str,
         default=None,
-        help="PostgreSQL connection string (overrides DATABASE_URL env var)",
+        help="Path to SQLite database file (overrides SEATAERO_DB env var)",
     )
     parser.add_argument(
         "--skip-scanned",
@@ -364,7 +364,7 @@ def main():
     if args.skip_scanned:
         print("Checking database for routes already scanned today...")
         try:
-            conn = db.get_connection(args.database_url)
+            conn = db.get_connection(args.db_path)
             scanned = db.get_scanned_routes_today(conn)
             conn.close()
         except Exception as exc:

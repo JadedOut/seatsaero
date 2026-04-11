@@ -14,80 +14,39 @@ WHEN NOT TO READ THIS FILE:
 - When the current task context already contains the needed information
 
 This is a reference document, not a working document.
-Sections marked with ⚠️ are critique annotations added during architecture review.
 -->
 
-# Project brief: free, open-source United award flight search tool
+# Project brief: United award flight search CLI
 
 ## What this project is
 
-A free, open-source alternative to the paid features of Seats.aero, scoped to United MileagePlus award flights within the US and Canada. The tool scrapes United's award search API on a schedule, caches the results, and lets anyone search availability and set alerts without paying $10/month.
+A free, open-source CLI tool for United MileagePlus award flight search, scoped to Canada routes. The CLI scrapes United's award search API, stores results in a local SQLite database, and lets you search availability from the command line. No hosted service, no web UI, no subscriptions.
 
-## Background: what is Seats.aero and why does it matter
+## Design philosophy
 
-Seats.aero is a metasearch engine for airline award flights. It lets you find where to redeem airline miles/points across 24+ frequent flyer programs simultaneously, instead of searching each airline's website one at a time. It doesn't book flights; it surfaces availability so you can book on the airline's site.
+**The CLI is a tool for AI agents to call, not a tool humans type into directly.**
 
-Founded in June 2022 by Ian Carroll (security researcher, ex-Dropbox/Robinhood) as a personal side project. Originally called "awards.pnr" and promoted on Reddit. Now at $7M ARR, 500K monthly active users, 100K+ paid members, with Chris Lopinto (former ExpertFlyer co-founder) as CEO. Completely bootstrapped, zero outside funding.
+The intended user experience is natural language: you ask a question ("what's the cheapest business class from Toronto to LA in July?"), and an AI agent — Claude Code, OpenClaw, or any other — translates that into the right `seataero` CLI call, parses the structured output, and presents the answer. The CLI is the machine-readable API layer; the agent is the human-readable interface layer.
 
-### How Seats.aero works
+Core principles:
 
-Automated bots continuously scrape airline loyalty program websites, sending HTTP requests to their search pages and parsing the results. Scraped data is stored in a massive cache (reportedly Amazon Aurora/PostgreSQL, 1B+ rows). When you search on Seats.aero, you're querying their cache, not the airline. Results load instantly but can be minutes-to-hours stale. Each result shows a "Last Seen" timestamp.
+1. **Terminal-only.** No web UI. Everything happens in the terminal. The CLI can return structured data (`--json`, `--csv`) for agents to parse, or formatted tables/graphs for direct human reading. Future work may include prompt-engineering hints that help agents render rich terminal visualizations (sparklines, charts, color-coded tables).
 
-### What Seats.aero charges for
+2. **Agent/AI agnostic.** The CLI must not be coupled to any specific AI framework. An MCP server (`mcp_server.py`) exposes seataero commands as typed tools over the Model Context Protocol — any MCP-compatible agent (Claude Code, ChatGPT, Cursor, VS Code Copilot, etc.) discovers and calls seataero without manual configuration. Agents without MCP support can still call the CLI directly — `seataero schema` provides runtime introspection, `--json` provides structured output. Works with shell scripts, cron, or a human typing commands.
 
-The free tier gives you: search within a 30-day window, up to 5 alerts, email notifications.
+3. **Light built-in scheduling.** The CLI includes basic scheduling (e.g., `seataero schedule` for daily scrapes + alert checks) so it works standalone. But users can swap in their own scheduler — cron, Task Scheduler, OpenClaw cron skills, whatever. The built-in scheduler is a convenience default, not a lock-in.
 
-Pro ($9.99/month or $99.99/year) unlocks: full year (365 days) search window, unlimited alerts, SMS alerts, live real-time search, advanced filters (direct flights only, fare class viewer, minimum seats, max fees), and API access.
+4. **Notifications are the agent's job.** The CLI surfaces alert matches via `seataero alert check --json`. How those matches reach the user (Telegram, WhatsApp, email, terminal popup) is the agent's responsibility, not seataero's. No notification channel plumbing built into the CLI.
 
-The most valuable Pro feature is the extended date range. Award seats, especially in premium cabins, get released 330-360 days before departure and often get snatched within days. A 30-day free window misses the entire planning horizon for most international trips.
+5. **No agent instructions in config files.** Agent discoverability happens through MCP tool schemas and `seataero schema`, not by embedding CLI manuals in agent-specific config files (CLAUDE.md, .cursorrules, etc.). The tool describes itself; agents don't need a cheat sheet.
 
-### Why Seats.aero is hard to replicate at full scale
+## Scope
 
-- 24 programs, each requiring a separate reverse-engineered scraper
-- Airlines actively fight scrapers (Air Canada sued Seats.aero in October 2023; the case is ongoing)
-- Both United and Aeroplan now require login to search awards (as of late 2025 / early 2025 respectively)
-- Scrapers break constantly as airlines update sites and bot detection
-- Infrastructure costs at scale: proxies, database, compute for 70K+ routes
-- The scraping code is the moat; it's proprietary and constantly maintained
-
-Competitors like AwardFares, Point.me, Roame, and PointsYeah all struggle to keep their scrapers working. AwardFares currently can't show Aeroplan data at all due to Air Canada's recent changes.
-
-## Our project: what we're building
-
-A United-only award search tool starting with Canada routes, expanding to US later. Free, open source (framework public, scraper implementations private), self-hostable.
-
-### Scope
-
-**Phase 1 (current): Canada routes only**
 - One airline program: United MileagePlus
 - Geographic coverage: Routes where at least one endpoint is a Canadian airport (9 airports: YYZ, YVR, YUL, YYC, YOW, YEG, YWG, YHZ, YQB)
-- Estimated meaningful route pairs: ~1,000-2,000 (Canada↔US + Canada↔Canada, filtered to routes with United service)
-- Scrape volume: ~24,000 requests/day (2,000 routes × 12 monthly windows) — achievable with 1 account, no proxies, single worker
-- Refresh cadence: daily full sweep (low volume makes hourly feasible too)
 - Date coverage: full 337 days (United's maximum award booking window)
-
-**Phase 1b (after Canada is stable): Expand to US domestic**
-- Add US domestic routes (241 destinations), bringing total to ~20,000 meaningful route pairs
-- Scrape volume increases to ~240,000 requests/day — requires account pool, proxy strategy, tiered scheduling
-- All infrastructure from Phase 1 carries over; only scaling changes needed
-
-### What we give away for free that Seats.aero charges for
-
-- Full 337-day search window (no 30-day cap)
-- Unlimited alerts (no 5-alert cap)
-- All advanced filters (direct flights, cabin class, min seats, max miles)
-- No account required to search
-- Hourly cache freshness on monitored routes
-- Price history and trend charts (Seats.aero Pro feature)
-- Calendar heatmap view
-- CSV data export
-- Booking deeplinks to united.com
-
-### What we can't match
-
-- Multi-program search (Seats.aero searches 24 programs; we only search United)
-- International coverage beyond US/Canada
-- Live real-time search (our cache is hourly; Seats.aero Pro does on-demand live queries)
+- Refresh cadence: daily full sweep
+- Runs locally — no server hosting required
 
 ## Technical approach
 
@@ -97,398 +56,312 @@ As of 2026, United is rated 2/5 difficulty for scraping by Scraperly (https://sc
 
 **Key discovery:** United's award calendar view returns an entire month of lowest-price availability per API call. One request for YYZ-LAX returns ~30 days of pricing data (miles cost + taxes per day). This means covering 337 days for one route requires only ~12 requests (337 / 30), not 337 individual date searches.
 
-**⚠️ Critical assumption to verify:** Does the calendar endpoint return only the cheapest option per day, or all available options across cabin classes? Does it include flight-level details (flight numbers, times, connections) or just daily price summaries? If it's price-summary-only, a second request per date is needed for flight details, which doubles or triples scrape volume and changes the entire architecture. This must be verified by inspecting the actual API response before any implementation.
-
 **Login requirement:** As of late 2025, United requires MileagePlus login to view award pricing. This was explicitly done to block third-party search tools. The scraper needs to maintain authenticated sessions.
 
 **Session management:** Use Playwright with persistent browser contexts to save login state between runs. Sessions stay alive for hours; the hourly scrape cadence naturally keeps them warm. Re-authentication is only needed when sessions expire (roughly once per day).
 
 **Anti-bot evasion:** United uses dual-layer bot protection: Cloudflare (TLS fingerprinting at the edge) and Akamai Bot Manager (JavaScript sensor cookies). curl_cffi with Chrome TLS impersonation handles Cloudflare, but Akamai requires a real browser to generate and maintain `_abck` cookies. The proven approach is a hybrid architecture: Playwright runs in the background as a "cookie farm" keeping Akamai cookies fresh, while curl_cffi makes the actual API calls using those cookies. See `docs/findings/curl-cffi-feasibility.md` and `docs/findings/hybrid-architecture.md`.
 
-**Account pool:** 10-20 MileagePlus accounts (free to create) distributing searches. Each account does ~350-700 searches per hour, which looks like an active but not suspicious user.
-
-**⚠️ Account tolerance is the #1 unknown.** The per-account rate limit has never been empirically tested. If United locks accounts at 50 requests/hour instead of 350-700, the project needs 400+ accounts and is likely infeasible. This number must be determined experimentally before committing to any architecture. See "Account lifecycle management" below.
-
-### Account lifecycle management 
-The account pool is not a config value — it's a first-class subsystem that needs:
-
-- **Health monitoring per account**: track success rate, captcha frequency, login failures, response latency
-- **Automatic rotation and quarantine**: when an account shows signs of flagging (rising captcha rate, slower responses), pull it from the pool and rest it
-- **Account-to-proxy affinity**: United will correlate account identity with IP. Switching an account across proxy IPs is a detection signal. Each account should have a sticky proxy assignment.
-- **Session lifecycle**: define what happens when a session expires mid-scrape, how sessions are distributed across workers, re-authentication flow, concurrent access control
-- **Credential storage**: encrypted at rest, never plaintext in config files. `config.example.json` shows the format; real credentials go in environment variables or an encrypted secrets file
-- **Detection signals**: beyond just HTTP errors — monitor for degraded results (e.g., fewer results returned, higher prices than expected, redirect to login page)
-
 ### Scrape volume math
 
 **Verified**: The calendar endpoint (`/api/flight/FetchAwardCalendar`) returns 30 days of pricing per request, covering ALL cabin classes (economy, business, first, premium economy) and both saver/standard award types in a single response. See `docs/api-contract/united-calendar-api.md` for full API contract.
 
-**Phase 1 — Canada only (~2,000 routes):**
-
-- 2,000 routes × 12 monthly windows = 24,000 requests for a full year sweep
+- ~2,000 routes x 12 monthly windows = ~24,000 requests for a full year sweep
 - One full sweep per day: ~0.3 requests/second sustained
 - Single worker completes in ~2 hours (with 5-10s delays between requests)
 - No proxies needed, 1 MileagePlus account sufficient
-- Can run on a laptop or free VPS
-
-**Phase 1b — Full US+Canada (~20,000 routes):**
-
-- 20,000 routes x 12 monthly windows = 240,000 requests for a full year sweep
-- One full sweep per day: ~2.8 requests/second sustained
-- With 5 concurrent workers: completes in ~13 hours
-- Hourly refresh on 500 alert routes x 12 months = 6,000 requests/hour = 1.7/second
-
-**⚠️ Concurrency model (underspecified, deferred to Phase 1b):** "5 concurrent workers" could mean threads, asyncio coroutines, multiprocessing, or Celery workers. Each has different implications for session management, database connection pooling, error isolation, and resource consumption. Playwright contexts are memory-heavy: 5 concurrent browsers consume 2-4 GB RAM. The choice should be deferred until empirical testing reveals the real constraints. Not needed for Phase 1 Canada-only scope.
-
-Phase 1b tiered approach (when scaling to US):
-
-| Tier | What | Routes | Frequency | Daily searches |
-|------|------|--------|-----------|----------------|
-| Alert routes | Routes with active user alerts | 500 | Every 2 hours | ~72,000 |
-| Hot routes | Popular hub-to-hub, days 1-30 | 2,000 | Every 6 hours | ~32,000 |
-| Rolling edge | All routes, day 330-337 | 20,000 | Daily | ~20,000 |
-| Full sweep | Everything else | 20,000 | Weekly | ~137,000 |
-| **Total** | | | | **~261,000/day** |
-
-> **Math correction:** Alert tier = 500 routes x 12 monthly windows = 6,000 requests/cycle x 12 cycles/day (every 2 hours) = 72,000/day. The original figure of 288,000 was incorrect (would imply every 30 minutes). Total revised from ~477K to ~261K/day.
+- Can run on a laptop
 
 ### Data storage
 
-PostgreSQL from day one (not SQLite — concurrent writes from multiple workers will hit WAL contention on SQLite immediately). Same VPS.
+SQLite with WAL mode. Zero setup — just a file at `~/.seataero/data.db`. No Docker, no server, no connection strings.
+
+At our actual write rates (a few upserts per second), SQLite in WAL mode handles this fine.
 
 ```sql
 CREATE TABLE availability (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     origin TEXT NOT NULL,
     destination TEXT NOT NULL,
-    date DATE NOT NULL,
+    date TEXT NOT NULL,
     cabin TEXT NOT NULL,
+    award_type TEXT NOT NULL,
     miles INTEGER NOT NULL,
     taxes_cents INTEGER,
-    seats INTEGER,
-    direct BOOLEAN,
-    flights JSONB,
-    scraped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(origin, destination, date, cabin, direct)
+    scraped_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(origin, destination, date, cabin, award_type)
 );
 
--- Primary search pattern
 CREATE INDEX idx_route_date_cabin ON availability(origin, destination, date, cabin);
--- For pruning and freshness checks
 CREATE INDEX idx_scraped ON availability(scraped_at);
--- For alert matching (cabin + miles threshold queries)
 CREATE INDEX idx_alert_match ON availability(origin, destination, cabin, miles);
-
--- Alerts
-CREATE TABLE alerts (
-    id SERIAL PRIMARY KEY,
-    origin TEXT NOT NULL,
-    destination TEXT NOT NULL,
-    date_start DATE,
-    date_end DATE,
-    cabin TEXT,
-    max_miles INTEGER,
-    notify_channel TEXT NOT NULL,       -- 'telegram' or 'email'
-    notify_target TEXT NOT NULL,        -- chat_id or email address
-    last_notified_at TIMESTAMPTZ,      -- for deduplication
-    last_notified_hash TEXT,           -- hash of last notification content
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at DATE                    -- auto-expire past-date alerts
-);
-
--- Scrape job tracking
-CREATE TABLE scrape_jobs (
-    id SERIAL PRIMARY KEY,
-    origin TEXT NOT NULL,
-    destination TEXT NOT NULL,
-    tier TEXT NOT NULL,                -- 'alert', 'hot', 'edge', 'sweep'
-    status TEXT NOT NULL DEFAULT 'pending',  -- pending/running/done/failed
-    account_id TEXT,
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    error TEXT,
-    UNIQUE(origin, destination, tier, started_at)
-);
 ```
 
-**Upsert strategy:** Use `INSERT ... ON CONFLICT (origin, destination, date, cabin, direct) DO UPDATE` to avoid duplicate rows. Without this, every scrape cycle creates redundant rows — millions per day before pruning.
+**Upsert strategy:** `INSERT ... ON CONFLICT (origin, destination, date, cabin, award_type) DO UPDATE` to avoid duplicate rows.
 
-**JSONB trade-off:** The `flights JSONB` column stores flight details (flight numbers, times, connections) but cannot be efficiently filtered in SQL. If alerts need to filter on "nonstop only" or "departing after 6pm," this becomes expensive. Consider a separate `flight_segments` table if query patterns demand it. For MVP, JSONB is acceptable.
+**Price history:** An `availability_history` table automatically captures every price change via SQLite triggers. An AFTER INSERT trigger records first sightings; an AFTER UPDATE trigger (with `WHEN` clause checking miles/taxes_cents) records only actual price changes. No scraper modifications needed — triggers fire automatically on `upsert_availability`.
 
-**Pruning strategy:** Delete rows where a newer scrape exists for the same route/date/cabin, not a blanket time-based TTL. If the scraper goes down for 48 hours, a time-based TTL would wipe the entire database. Schedule `VACUUM` after bulk deletes — PostgreSQL's MVCC creates dead tuples that must be cleaned up, especially on a small VPS where autovacuum competes with write throughput.
-
-**Storage estimate:** At ~261K writes/day, ~200-500 bytes/row = ~50-130 MB/day of raw inserts. With indexes and JSONB overhead, budget 200-300 MB/day. A 40 GB disk fills in ~4-5 months without pruning. Monitor disk usage and set up alerts.
+**Storage estimate:** ~50-100 MB for the full database at Canada scale.
 
 ### Alert system
 
-After each scrape cycle, compare new results against saved alert criteria. Notify via Telegram Bot API (free, instant) or email. Matching is a simple database query: "any new availability on this route, in this cabin, at or below this miles threshold, since last notification?"
+Managed via CLI: `seataero alert add YYZ LAX --cabin business --max-miles 70000`. Alerts are stored in the local database. After each scrape, matching is a simple query: "any new availability on this route, in this cabin, at or below this miles threshold, since last notification?"
 
-**Deduplication:** Without dedup, users get re-notified every 2 hours for unchanged availability. The `alerts` table tracks `last_notified_at` and `last_notified_hash` (hash of the matching availability data). Only notify when the hash changes (new availability appeared, price dropped, or seats changed).
+**Deduplication:** The `alerts` table tracks `last_notified_at` and `last_notified_hash` (hash of the matching availability data). Only notify when the hash changes (new availability appeared, price dropped, or seats changed).
 
-**Alert evaluation timing:** "After each scrape cycle" is vague when there are 4 tiers with different cadences. Alert evaluation should run per-route immediately after that route is scraped, not as a batch after all routes complete. This gives the fastest notification latency for alert-tier routes.
+**Notification delivery:** The CLI exposes matches via `seataero alert check --json`. Delivering those matches to the user (Telegram, email, terminal notification) is the responsibility of the calling agent or scheduler, not seataero itself.
 
-**Rate limiting outbound notifications:** If a user creates a broad alert that matches hundreds of results, batch them into a single digest message rather than spamming individual notifications. Cap at ~1 notification per alert per evaluation cycle.
+**Alert lifecycle:** Auto-expire alerts where all dates have passed.
 
-**Alert lifecycle:** Auto-expire alerts where all dates have passed. Cap alerts per user to prevent database bloat (e.g., 50 per notify_target).
+### Interface: CLI
 
-**Notification reliability:** Queue failed notifications for retry. If Telegram rate-limits the bot (~30 messages/second), back off and retry. Log all notification attempts for debugging.
-
-### Frontend
-
-A simple web app. No signup required. Search bar with origin, destination, date range, cabin class. Results page showing availability with miles cost, seats remaining, last-checked timestamp, and a link to book on united.com. Alert form where you enter Telegram handle or email.
-
-### Open-source architecture
+The primary interface is a `seataero` CLI that wraps the scraping pipeline and database queries into simple commands:
 
 ```
-award-scraper/
+seataero search YYZ LAX                          # scrape one route
+seataero search --file routes/canada_us_all.txt   # scrape from route file
+seataero search --file routes.txt --workers 3     # parallel scrape
+seataero query YYZ LAX                            # query stored results (table)
+seataero query YYZ LAX --json                     # query stored results (JSON)
+seataero query YYZ LAX --date 2026-05-01          # detail for a specific date
+seataero query YYZ LAX --from 2026-05-01 --to 2026-06-01  # date range filter
+seataero query YYZ LAX --cabin business           # filter by cabin class
+seataero query YYZ LAX --sort miles --csv         # sort + CSV export
+seataero query YYZ LAX --history                  # route-level price history summary
+seataero query YYZ LAX --date 2026-05-01 --history # price timeline for a date
+seataero query YYZ LAX --json --fields date,miles  # select specific JSON fields
+seataero query YYZ LAX --json --meta               # JSON with _meta type hints
+seataero alert add YYZ LAX --max-miles 70000       # create a price alert
+seataero alert add YYZ LAX --max-miles 70000 --cabin business --from 2026-05-01 --to 2026-06-01
+seataero alert list                               # show active alerts
+seataero alert list --all                         # include expired alerts
+seataero alert remove 1                           # delete alert by ID
+seataero alert check                              # evaluate alerts against current data
+seataero status                                   # DB stats, coverage, freshness
+seataero setup                                    # init DB schema, check credentials
+seataero schedule add daily-run --every daily --file routes/canada_us_all.txt  # schedule a job
+seataero schedule list                            # show scheduled jobs
+seataero schedule remove daily-run                # delete a schedule
+seataero schedule run                             # start scheduler (foreground)
+seataero schema                                   # list all commands (JSON)
+seataero schema query                             # full parameter + output schema
+```
+
+Every command supports `--json` for machine-readable output. Terminal output uses Rich-formatted colored tables with sparklines when stdout is a TTY; piped output degrades to plain text or auto-switches to JSON.
+
+### Project layout
+
+```
+seataero/
+  cli.py                         # main() + subcommand dispatch
+  mcp_server.py                  # MCP server — exposes CLI commands as typed tools
+  pyproject.toml                 # [project.scripts] seataero = "cli:main"
   core/
-    db.py              # PostgreSQL/SQLite schema, queries, pruning
-    scheduler.py       # cron/APScheduler, tiered priority logic
-    alerts.py          # matching engine + Telegram/email notifications
-    models.py          # AwardResult dataclass, route priority tiers
-  scrapers/
-    base.py            # abstract AwardScraper interface
-    example.py         # documented skeleton with comments
-    # actual implementations are .gitignored (private)
-  web/
-    app.py             # Flask/FastAPI search API
-    templates/         # minimal HTML frontend
-  config.example.json  # route list, account credentials template
-  scrape.py            # main entry point
-  README.md
+    db.py                        # schema, queries, upsert (SQLite)
+    models.py                    # AwardResult dataclass, validation
+    output.py                    # Rich tables, sparklines, auto-TTY detection
+    schema.py                    # command schema introspection for agents
+    scheduler.py                 # APScheduler 3.x + SQLite job persistence
+  scripts/
+    burn_in.py                   # multi-route runner (standalone, JSONL logging)
+    orchestrate.py               # parallel worker orchestrator (used by CLI --workers)
+    experiments/
+      hybrid_scraper.py          # curl_cffi + cookie farm
+      cookie_farm.py             # Playwright browser management
+      united_api.py              # request/response building
+  scrape.py                      # scrape_route() — imported in-process by CLI
+  routes/                        # route list files
 ```
 
-The framework is public. Scraper implementations are private (publishing them accelerates the arms race with airline bot detection). The README includes a guide on reverse-engineering airline APIs using Chrome DevTools so people can write their own scraper plugins.
+The CLI imports `scrape_route()` from `scrape.py` in-process for single-route and batch search. Parallel search (`--workers > 1`) delegates to `orchestrate.py` via subprocess (each worker needs its own browser instance). Query/status/alert operations use `core/db.py` directly.
 
-**⚠️ Open-source tension:** If scraper implementations are `.gitignored`, users cannot actually run the tool without reverse-engineering the API themselves. The project is an open-source framework with a proprietary plugin, not a usable open-source product. This is a deliberate trade-off — making the scraper public lets United trivially target it — but should be explicitly communicated. Options: (a) accept the framework-only model, (b) distribute scraper implementations via a separate private channel, (c) encrypted blobs with a shared key in a community Discord.
+### Agent integration: MCP server
+
+`mcp_server.py` uses FastMCP (`mcp.server.fastmcp`) to expose 10 typed MCP tools over stdio. FastMCP `instructions` field provides tool selection guidance during the MCP `initialize` handshake. `ToolAnnotations` mark read-only tools (`readOnlyHint=True` on `query_flights`, `get_flight_details`, `get_price_trend`, `find_deals`, `flight_status`, `check_alerts`) to reduce agent permission friction. Read-only tools call `core/db.py` directly. Tools follow a summary/detail split pattern: `query_flights` returns only a pre-computed summary (~150-300 tokens) with cheapest deal, saver/standard counts, miles range, data age, display hint, and format suggestions — no raw rows. `get_flight_details` provides paginated raw rows (default 15, max 50) with `limit`/`offset` for when agents need to build tables. `get_price_trend` returns per-date cheapest miles as a compact time series for graphing. `find_deals` does server-side cross-route analysis to find below-average pricing. This "list/get" pattern keeps default calls cheap (~150 tokens) and lets agents escalate to expensive calls only when needed — preventing context window blowup in multi-turn conversations. Write tools (`search_route`, `submit_mfa`, `stop_session`) manage a persistent in-process CookieFarm session — the browser stays alive across scrapes, so MFA is only needed on the first login. Python type hints become JSON Schema input definitions; tool docstrings include "when to use" / "when NOT to use" guidance. `mcp.run(transport="stdio")` handles the JSON-RPC message loop.
+
+```
+AI Agent  ←JSON-RPC→  mcp_server.py  ←import→  core/db.py
+                            │
+                            ├──in-process──→  CookieFarm (persistent browser session)
+                            │                    └→ HybridScraper → scrape_route()
+                            │
+                            └──file handoff──→  ~/.seataero/mfa_request  (MFA needed)
+                                                ~/.seataero/mfa_response (code from submit_mfa)
+```
+
+Multi-turn scrape flow (the natural-language experience):
+1. Agent calls `search_route("YYZ", "LAX")` → MCP server starts CookieFarm + login in background thread
+2. If MFA required: returns `{"status": "mfa_required", "message": "SMS code sent to your phone"}`
+3. Agent asks user for code in plain language, user types `847291`
+4. Agent calls `submit_mfa("847291")` → writes code to `~/.seataero/mfa_response`, waits for scrape thread to finish
+5. Returns `{"status": "complete", "found": 1551, "stored": 1551}`
+6. Subsequent `search_route` calls reuse the warm session — no MFA, no browser startup
+7. Agent calls `stop_session()` when done to shut down the browser
+
+Any MCP-compatible client discovers typed tool schemas automatically — parameter names, types, descriptions, and return formats. No manual instructions needed. Register in Claude Code with `claude mcp add seataero -- python mcp_server.py`, or add to `.mcp.json` for project-scoped auto-discovery.
+
+For agents without MCP support, `seataero schema` returns the same information as JSON, and all commands support `--json` for structured output.
 
 ### Infrastructure and cost
 
+Runs on your local machine. No VPS, no domain, no Docker, no hosted infrastructure.
+
 | Component | Spec | Monthly cost |
 |-----------|------|-------------|
-| VPS | Hetzner CX32+ (4 vCPU, 8GB RAM minimum — CX22 at 4GB cannot run PostgreSQL + workers + web server, and Playwright needs 8GB+) | $7-38 |
-| Proxies | 5-10 rotating datacenter IPs (may not be needed at low volume) | $0-15 |
-| Database | PostgreSQL on same VPS | $0 |
-| Notifications | Telegram Bot API | $0 |
-| Domain | Optional | $0-1 |
-| **Total** | | **$7-54/month** |
-
-For personal use at 50 routes: $0 (run on your laptop or free Oracle Cloud VM with PostgreSQL).
-For full US+Canada coverage: $15-40/month.
-
-### Proxy strategy: start free, scale only if needed
-
-United's Cloudflare protection is light (2/5 difficulty). At personal-use volume (50-100 routes/hour), proxies may not be necessary at all. The approach is to start with the cheapest option and only escalate if you get blocked.
-
-**Tier 0: No proxy ($0).** Run the scraper from your home IP, a university network, or a free Oracle Cloud VM. At low request volume with human-like delays between searches, United's Cloudflare likely won't flag you. Try this first for at least a week before spending anything.
-
-**Tier 1: Webshare free tier ($0).** If your IP gets rate-limited, Webshare offers 10 rotating datacenter proxies for free, forever, with unmetered bandwidth. US IPs included. This is enough for personal-scale scraping. Trustpilot rated 4.7/5.
-
-**Tier 2: Oxylabs free tier ($0).** 5 free datacenter proxy IPs upon registration (no credit card required), US-located, 5GB/month bandwidth cap. At ~50-100KB per request, that's 50,000-100,000 requests/month, plenty for this project.
-
-**Tier 3: GitHub Student credits ($0 with student status).** The GitHub Student Developer Pack includes $200 DigitalOcean credits, $100 Azure credits, and more. Spin up 2-3 small VMs in different US regions and use them as your own proxy pool. No proxy service needed; each VM has its own datacenter IP with unlimited bandwidth. Effectively free for the duration of the credits.
-
-**Tier 4: Webshare paid ($3/month).** 100 shared datacenter IPs with 250GB bandwidth. Only needed if you're scaling to full US+Canada coverage (20,000 routes) and the free tiers aren't enough.
-
-For a university student, Tier 0-3 should cover the project indefinitely at $0/month. Paid proxies are a last resort for scale, not a starting requirement.
-
-## What Seats.aero data looks like vs United's actual data
-
-Verified with manual testing: Seats.aero's cached data closely matches United's live results. Example from March 31, 2026:
-
-- **United's calendar view** for YYZ-LAX: shows 13,000 miles + $68.51 taxes for most dates in April-May 2026. Some dates show 16.7k, 21.3k (dynamic pricing when saver inventory is sold out).
-- **Seats.aero's cached data** for the same route: "2026-04-21, 20 hours ago, United, YYZ-LAX, 13,000 pts" which matches the 13k saver price on United's calendar.
-
-The saver price (13k in this case) is the floor. Higher prices on specific dates mean saver seats are gone and United is showing the next tier up. Detecting and alerting on saver availability is the core value of the tool.
-
-## Award availability basics (for context)
-
-Airlines release award seats 330-360 days before departure. United's window is 337 days. When those seats first appear, premium cabin saver fares are available. They get booked quickly. Monitoring the "rolling edge" (day 330-337) for new availability is the highest-value use case.
-
-Fare classes to know for United:
-- X/XN = saver economy
-- IN = saver business
-- O = saver first
-
-These are the fare classes that show the lowest miles prices and that partner programs (like Aeroplan) can also book.
-
-## Key resources
-
-- **Scraperly United guide**: https://scraperly.com/scrape/united-airlines (difficulty rating, anti-bot details, proxy recommendations, tool suggestions)
-- **Scrapfly Academy**: https://scrapfly.io/academy (free structured course on web scraping fundamentals, reverse engineering, DevTools usage)
-- **Playwright docs - Authentication**: https://playwright.dev/docs/auth (persistent contexts, session management)
-- **curl_cffi**: https://github.com/yifeikong/curl_cffi (browser TLS fingerprint impersonation for direct HTTP)
-- **mitmproxy**: https://mitmproxy.org (intercepting proxy for understanding auth flows)
-
-## Operational concerns
-### This is an adversarial systems problem, not a data engineering problem
-
-The data storage and web serving components are straightforward. The scraping reliability system — maintaining stable access to United's API against an actively hostile counterparty — is where this project will succeed or fail. Account management, detection evasion, and failure recovery deserve as much design attention as the data pipeline.
-
-### Error handling taxonomy
-
-~261K daily requests will produce thousands of errors. Each needs different handling:
-
-| Error | Meaning | Action |
-|-------|---------|--------|
-| HTTP 403 | Cloudflare blocked | Rotate proxy, retry with backoff |
-| HTTP 429 | Rate limited | Back off this account/proxy for 15-60 min |
-| Captcha page | Bot detection triggered | Quarantine account, escalate to Playwright |
-| Redirect to login | Session expired | Re-authenticate, retry |
-| Malformed JSON | API changed or partial response | Log raw response, skip route, alert operator |
-| Timeout | Network issue or slow response | Retry once, then skip |
-| Unexpected price (negative, 0, >500K) | Parsing bug or data anomaly | Reject row, log for investigation |
-
-### Data validation
-
-Scraped data is notoriously inconsistent. The parser must reject anomalous data rather than inserting garbage. A parsing bug that shows 5,000 miles for business class saver will trigger every alert and destroy user trust. Validate: miles > 0 and < reasonable max, dates within expected range, cabin is a known value, origin/destination are valid IATA codes.
-
-### Monitoring and observability
-
-For a system making ~261K requests/day, you need at minimum:
-- Scrape success/failure rates per tier, per account, per proxy
-- Average response time per request
-- Database size, connection pool utilization, dead tuple count
-- Alert notification success/failure rates
-- Account health metrics (captcha rate, error rate per account)
-- Disk usage alerts (critical for a small VPS)
-
-Without these, you won't know the system is degrading until users report it.
-
-### Recovery and deployment
-
-- **Deployment:** Docker Compose with containers for PostgreSQL, scraper, scheduler, and web server. Minimum viable process management.
-- **Backup:** Daily `pg_dump` to object storage. Alert configs and user data are the irreplaceable part; scraped availability is ephemeral.
-- **Graceful shutdown:** If the scraper crashes mid-sweep, it should resume from where it left off using the `scrape_jobs` table, not restart the entire sweep.
-- **Disk full:** PostgreSQL refuses writes when disk is full, corrupting in-flight transactions. Set up disk usage monitoring with alerts at 80% and 90%.
-
-### Legal risk (acknowledged for Aeroplan but missing for United)
-
-United's Terms of Service prohibit automated access. While legal risk for a free personal tool is low, it is not zero. United can send cease-and-desist letters. The `.gitignored` scraper implementations help here — the public repo contains a framework, not a United-specific scraping tool. This should be explicitly communicated in the README.
-
-## Phase 1 plan
-
-Validation-first. Each step gates the next — if any step reveals a blocking problem, pivot before wasting time on things that depend on it. The UI and alerts have zero risk; the scraping system has nearly all the risk. Defer all UI/alert work until the scraper has run successfully at 500+ routes for at least one week.
-
-| Step | What | Why | Time |
-|------|------|-----|------|
-| **0** | ✅ DONE. Reverse-engineer the calendar API via DevTools. Capture exact URL, headers, cookies, request body, response JSON schema, error formats. Save HAR files. | Everything downstream depends on this API contract. Verified: calendar returns all cabins in one response, 30 days per request. See `docs/api-contract/`. | 1-2 days |
-| **~~1~~** | ~~Create 2-3 MileagePlus accounts. Hit the calendar endpoint at increasing rates.~~ **SKIPPED for now.** | At Canada-only scale (~24K req/day, ~300-400 req/hr from one account), rate limits are unlikely to be an issue. One account with human-like delays (5-10s between requests) should be fine. If we get locked out, we'll deal with it then — no point over-engineering for a problem that may not exist at this volume. Rate limit testing becomes relevant when scaling to US in Phase 1b. | — |
-| **1** | ✅ DONE. Build hybrid scraper: curl_cffi for API calls + Playwright cookie farm in background. Playwright maintains Akamai cookies (`_abck`) that burn every ~3-4 requests. curl_cffi pulls fresh cookies before each batch. Manual login via Playwright on first run (Gmail MFA). | curl_cffi alone fails — Akamai burns cookies after ~3-4 calls (see `docs/findings/curl-cffi-feasibility.md`). Pure Playwright works but is 10x slower. Hybrid gets curl_cffi speed with Playwright cookie freshness. See `docs/findings/hybrid-architecture.md`. | 2-3 days |
-| **2** | ✅ DONE. Build minimal data path: PostgreSQL schema (with upsert), single-threaded scraper for 1 route, parser with validation, storage. Verify data matches united.com manually. | Validates API contract + parsing + storage end-to-end. No concurrency, no scheduling, no alerts. 922 records stored, 60 tests passing (models, db, parser). | 3-5 days |
-| **3** | ✅ DONE. Burn-in test: 10-minute supervised run, then 1-hour run. Observe: session expiry timing, error patterns, rate limit behavior, response consistency across different routes and dates. 10 min: 4 routes, 48/48 windows (100%), 5,057 solutions, 0 errors. Data verified against united.com. 1 hour: stable, no issues. | Surfaces real-world constraints that the scaling model depends on. The supervised runs catch infrastructure issues (Playwright crashes, login failures) before committing to longer runs. | 2 days (mostly waiting) |
-| **4** | ✅ DONE. Web UI: Next.js + shadcn/ui frontend with FastAPI backend. Dark theme, seats.aero-style layout. Home page with origin/destination search, results page with availability table (Date, Last Seen, Program, Departs, Arrives, Economy, Premium, Business, First). Green badges for available, gray for not available. Info icon per row shows all offerings for that date. | Users need to visualize scraped data. Pull UI work forward since the data pipeline is proven. | 1 week |
-| **5** | ✅ DONE. **Latest run (2026-04-04): 100% success rate.** Ephemeral browser profile fix eliminated stale Akamai cookie poisoning. 15 routes, 180/180 windows OK (100%), 16,386 solutions found/stored, 0 rejected, 0 errors, 0 burns, 0 circuit breaks, 0 session expiries. 35 min scrape time. Default delay changed to 3s for sustained reliability. Key changes: fresh temp browser profile per session (no persistent `.browser-profile`), non-invasive cookie-only login polling, manual MFA handoff. Log: `logs/burn_in_20260404_161633.jsonl`. Previous run (2026-04-03): 99.5% (191/192 windows, 1 transient curl error). | Validates long-running stability before scaling to all Canada routes. 100% success rate across 15 routes confirms ephemeral profile approach is production-ready. | 1 day |
-| **6** | Scale to all Canada routes (~2,000). Run for 1+ week. Measure scrape success rate, data freshness, disk usage, PostgreSQL performance. **Validated aggressive timing settings** from Step 5b experiment: `refresh_interval=3, delay=1s, session_budget=9999` (100% success, 0 errors, 0 burns across 84 requests/7 routes -- see `docs/findings/aggressive-timing-experiment.md`). Use these as the default for the scale-up; they cut per-route duration by 60-70% vs conservative settings. | Prove the core loop works at Canada scale before building anything on top of it. No concurrency model or account pool needed at this volume — single worker, single account. | 1-2 weeks |
-| **6a** | Calendar view: month-view grid with price heatmap per cabin class. Green = saver available, yellow = standard only, gray = no availability. Click a date cell to see detail modal. Replaces scrolling through 337 rows. | Most impactful visual gap vs Seats.aero. Makes browsing a full year of data practical. The toggle placeholder already exists in the filter bar. | 3-5 days |
-| **6b** | Date range search + result sorting: functional date picker in search form (start/end date). Column sorting in results table (by date, miles, cabin). Server-side date range filter on /api/search endpoint. | Currently shows all 337 days in fixed date order. Users need to narrow by travel window and sort by price to find deals. | 2-3 days |
-| **6c** | Booking deeplinks: "Book on United" button on each result row/detail modal. Opens united.com award search pre-filled with origin, destination, date, and cabin. | Zero-friction path from finding availability to booking. Without this, users must manually re-search on united.com. Core UX gap. | 1 day |
-| **6d** | Price history tracking: new `availability_history` table that logs price snapshots over time (INSERT, not just upsert). Line chart in UI showing miles cost trend per route/cabin over days/weeks. | Seats.aero charges $10/mo for this. Shows "is this a good price?" via historical context. Enables future price-drop alerts. | 3-5 days |
-| **6e** | CSV data export: download button on search results page. Exports currently visible/filtered results as CSV (date, cabin, miles, taxes, direct, last_seen). | Power users want data in spreadsheets for analysis. Trivial to implement, high utility. | 1 day |
-| **7** | Alerts and Telegram notifications. | Low risk, straightforward once data pipeline is proven. | 3-5 days |
-| **8** | Gradually expand toward full US+Canada coverage. | Only after prior steps are stable. | Ongoing |
-
-## Phase 2: Aeroplan (harder, separate phase)
-
-Air Canada's Aeroplan is the next target after United is stable. It's more valuable (better partner pricing, fixed zone rates on partner flights) but significantly harder to scrape.
-
-### Why Aeroplan matters
-
-Aeroplan is one of the most valuable loyalty programs for award travel. It's a Star Alliance member with 40+ partner airlines, and critically:
-
-- **Fixed zone pricing on partner flights**: A YYZ-FRA flight on Lufthansa or SWISS costs a predictable 60,000-70,000 points in business class based on distance, regardless of demand. This is often far cheaper than booking through the partner airline's own program.
-- **Dynamic pricing on Air Canada/United/Emirates flights**: Prices fluctuate with demand, ranging from reasonable (10.7K economy) to absurd (178.4K for a domestic connection).
-- **Transfer partner for every major US credit card program**: Chase, Amex, Capital One, Citi, Bilt all transfer 1:1 to Aeroplan. Anyone with transferable points can use it.
-- **No fuel surcharges on partner awards**: Booking a Lufthansa flight through Aeroplan avoids the hundreds of dollars in surcharges Lufthansa's own program charges.
-
-The key insight: you almost always want to book partner flights (not Air Canada metal) through Aeroplan, because those get fixed zone rates. Air Canada's own flights get dynamic pricing that can be 2-5x higher for the same distance.
-
-### Verified data accuracy
-
-Manually verified on March 31, 2026, for YYZ-SFO on April 21, 2026:
-
-**Seats.aero cached data**: "2026-04-21, 23 hours ago, Aeroplan, YYZ-SFO, 10,700 pts economy, 25,400 pts business"
-
-**Air Canada's live search results** (same route, same date, booked with Aeroplan points):
-
-| Flight | Route | Economy | Premium Econ | Business |
-|--------|-------|---------|-------------|----------|
-| AC nonstop 08:15 | YYZ-SFO | 10.7K + CA$125 | -- | 25.4K + CA$125 |
-| AC nonstop 10:45 | YYZ-SFO | 16.1K + CA$125 | -- | 178.4K + CA$125 |
-| AC nonstop 18:50 | YYZ-SFO | 12.5K + CA$125 | -- | 111.6K + CA$125 |
-| UA nonstop 06:30 | YYZ-SFO | 15K + CA$164 | -- | -- |
-| UA via ORD 12:05 | YYZ-SFO | 11.6K + CA$171 | -- | 25.9K + CA$171 |
-| UA via SAN 09:30 | YYZ-SFO | 12.5K + CA$171 | -- | 25K + CA$171 |
-
-Seats.aero's 10,700 pts matches the lowest economy fare (AC nonstop 08:15). Seats.aero's 25,400 pts matches the lowest business fare (same flight). The data is accurate; Seats.aero captures the cheapest available option per cabin class.
-
-Notice the massive price variation: business class on the same route, same day ranges from 25.4K (saver on the 08:15) to 178.4K (dynamic on the 10:45). The 25.4K is the deal. Monitoring for these saver prices and alerting when they appear is the core value.
-
-### How Aeroplan's search works
-
-The search returns all flights for a given route and date, across Air Canada, Air Canada Express, Air Canada Rouge, and partner airlines (United, Lufthansa, SWISS, etc.). Each flight shows:
-
-- Points cost per cabin class (economy, premium economy, business)
-- Taxes/fees in CAD
-- Seats remaining per cabin
-- Operating airline
-- Connection details (stops, layover duration, airports)
-
-The calendar bar at the top shows the lowest economy fare per day across a ~5-day window (e.g., Sun Apr 19: 22.8K, Mon Apr 20: 11.6K, Tue Apr 21: 10.7K). This is comparable to United's monthly calendar view, though Aeroplan's shows fewer days per view.
-
-A single search for YYZ-SFO returned 49 flights, including Air Canada nonstops, United-operated connections through ORD/EWR/IAH/DEN, and Air Canada connections through YVR/YUL. The data is rich: origin, destination, departure time, arrival time, duration, stops, connecting airports, operating airline, points cost per cabin, seats remaining.
-
-### Challenges specific to Aeroplan scraping
-
-**Login + 2FA required**: As of March 2025, Air Canada requires Aeroplan login to search award availability. Every login triggers a 2FA code sent to email or SMS. The scraper needs to handle automated 2FA (IMAP email reading or Twilio SMS). Sessions stay alive for hours once authenticated, so the 2FA flow should only trigger once per day if the scraper runs hourly.
-
-**Active legal hostility**: Air Canada sued Seats.aero in October 2023 (US District Court of Delaware) for scraping Aeroplan data. The judge denied the preliminary injunction in March 2024, but the case continues. Air Canada uses CFAA, trademark, and trespass-to-chattels claims. For personal-scale scraping (50 routes/hour from a residential IP), legal risk is effectively zero, but worth noting.
-
-**Akamai bot detection**: Air Canada uses Akamai Bot Manager, which is harder to bypass than United's Cloudflare. Akamai injects JavaScript challenges that generate sensor data tokens. Direct HTTP requests with curl_cffi may not be sufficient; Playwright with stealth patches is the likely required approach.
-
-**Website instability**: Air Canada's site is notoriously unreliable. Account creation frequently fails with generic error messages. The search itself can be slow and return inconsistent results. The scraper needs robust error handling, retries with exponential backoff, and tolerance for partial failures.
-
-**No Scraperly guide**: Unlike United (which has a full Scraperly guide at https://scraperly.com/scrape/united-airlines), Air Canada has no Scraperly difficulty rating or scraping recipe. The reverse-engineering must be done from scratch using DevTools and mitmproxy.
-
-### Aeroplan scraper approach
-
-**Authentication flow**:
-1. Navigate to aircanada.com, click sign in
-2. POST credentials (Aeroplan number + password)
-3. Receive 2FA prompt, code sent to email
-4. Read code from email via IMAP (programmatically)
-5. Submit 2FA code
-6. Session cookies set; save to persistent Playwright context
-
-**Search flow**:
-1. Navigate to the award search page with "Book with Aeroplan points" toggled
-2. Enter origin, destination, date, passengers
-3. Submit search
-4. Wait for results to load (Aeroplan uses a polling/async pattern; results don't appear instantly)
-5. Intercept the API response JSON via Playwright's network interception, or parse the rendered DOM
-6. Extract: flights, points per cabin, taxes, seats remaining, operating airline, connections
-
-**Data model** (extends the United schema):
-
-```sql
--- Same availability table works; the 'program' column distinguishes United vs Aeroplan
--- Additional fields for Aeroplan:
---   operating_airline TEXT (e.g., 'AC', 'UA', 'LH', 'LX')
---   taxes_cad INTEGER (Aeroplan shows taxes in CAD, not USD)
---   connections JSONB (stop airports and layover durations)
+| Local machine | Your laptop/desktop (needs ~2GB RAM for Playwright) | $0 |
+| SQLite | Just a file — zero setup | $0 |
+| **Total** | | **$0/month** |
+
+## Operational notes
+
+- **Data validation** is already implemented in `core/models.py`: IATA codes, date ranges, cabin types, miles bounds (1-500K), taxes. Invalid data rejected before DB.
+- **Error handling** is already implemented in the scraper: HTTP 403/429/redirect detection, session recovery, circuit breaker, exponential backoff.
+- **Recovery:** SQLite file at `~/.seataero/data.db` — back up by copying. Scrape interruptions are safe (every route upserted immediately). `--skip-scanned` resumes where you left off.
+- **Legal risk:** United ToS prohibits automated access. Low risk for personal use. Public repo contains framework only; scraper implementations are `.gitignored`.
+
+## What's already built (scraper foundation)
+
+The scraping pipeline is proven and production-ready:
+
+- **API contract** — United's calendar endpoint reverse-engineered and documented (`docs/api-contract/`)
+- **Hybrid scraper** — curl_cffi + Playwright cookie farm. Handles Cloudflare TLS fingerprinting and Akamai `_abck` cookies. SMS MFA with automated code entry (`scripts/experiments/`)
+- **CLI entry point** — `cli.py` with argparse subparsers, `pyproject.toml` for `pip install -e .`. `seataero setup` runs diagnostics (DB, Playwright, credentials). `seataero search` runs the scraper in-process for single-route and batch modes (CookieFarm → HybridScraper → scrape_route via `_scrape_route_live()` helper), delegates to orchestrate.py for parallel (`--workers > 1`). `seataero query` reads stored availability from SQLite and prints Rich-formatted summary/detail tables or JSON; supports `--from`/`--to` date range filtering, `--cabin` cabin class filtering (economy/business/first with group expansion), `--sort` (date/miles/cabin), `--csv` export, `--history` for price history with sparklines, `--fields` for JSON field selection, `--meta` for JSON type hints, `--refresh` for auto-scrape on stale/missing data, and `--ttl HOURS` (default 12) for configurable staleness threshold. `seataero status` shows DB stats, record counts, route coverage, date range, freshness, and scrape job history. `seataero alert` manages price alerts: `add` creates alerts with route/cabin/miles/date filters, `list` shows active (or all with `--all`), `remove` deletes by ID, `check` evaluates against current availability with content-hash deduplication and auto-expiry. `seataero schedule` manages cron-based scheduling: `add` with `--cron` or `--every` aliases, `list`, `remove`, `run` (foreground blocking). `seataero schema [command]` returns JSON introspection for agent discovery. `--db-path`, `--json`, and `--meta` global flags work across all subcommands
+- **Data path** — Database schema, upsert with ON CONFLICT, row-level validation, `query_availability` with date, date range (`date_from`/`date_to`), and cabin list filters, `get_scrape_stats` and `get_job_stats` for aggregate reporting, `query_history`, `get_history_stats`, and `get_price_trend` for price history and sparkline data, `get_route_freshness` for per-route TTL/staleness checks (`core/db.py`, `core/models.py`). `availability_history` table with INSERT/UPDATE triggers for automatic price change tracking. `alerts` table with CRUD functions, match evaluation, content-hash deduplication, and auto-expiry. 358 tests passing (unit + L1 data-path integration + L2 CLI integration + feature tests). SQLite with WAL mode, zero-setup
+- **Terminal visualization** — Rich-powered colored tables, inline Unicode sparklines (`▁▂▃▄▅▆▇█`) for price trends in history views, auto-TTY detection (Rich when terminal, plain/JSON when piped). `core/output.py` with `sparkline()`, `should_use_json()`, `print_table()`, `print_error()`, `build_meta()`. All `_print_*` functions in `cli.py` use Rich. `--json` and `--csv` output unchanged (backward compatible)
+- **Agent discoverability** — `seataero schema [command]` returns JSON describing all commands, parameters (type, required, choices, defaults), output fields, and usage examples. `--meta` flag adds `_meta` block with field type hints to JSON output. `--fields` flag on `query --json` for field selection (reduces agent token consumption). Structured error JSON with `error`, `message`, `suggestion` keys. `core/schema.py` with `COMMAND_SCHEMAS` dict covering all 13 commands. MCP server (`mcp_server.py`) exposes these as typed tools for any MCP-compatible agent
+- **Scheduling** — `seataero schedule add/list/remove/run` for built-in cron-based scheduling. APScheduler 3.x with SQLAlchemyJobStore persists jobs to `~/.seataero/schedules.db`. Human-friendly aliases (`daily`, `hourly`, `twice-daily`). Each job runs `seataero search --file <routes> --headless --create-schema` then `seataero alert check`. `schedule run` blocks in foreground; OS-level daemonization left to user. `core/scheduler.py`
+- **MFA file handoff** — `--mfa-file` flag on `search` and `query --refresh` switches from `input()` to filesystem polling for SMS codes. Scraper writes `~/.seataero/mfa_request` (JSON with timestamp), polls `~/.seataero/mfa_response` for the code (2s interval, 300s timeout), cleans up both files. Enables non-interactive MFA from any external process. `_prompt_sms_file()`, `_get_mfa_prompt()` in `cli.py`. 5 tests in `TestMFAFileHandoff`. Without `--mfa-file`, behavior unchanged (`input()`)
+- **Burn-in validated** — 15 routes, 180/180 windows (100%), 16,386 solutions, 0 errors, 0 burns. Ephemeral browser profiles eliminate stale cookie poisoning. Single-route live test: YYZ-LAX 12/12 windows, 1,398 results, 0 errors (2026-04-09)
+- **Parallel orchestrator** — `scripts/orchestrate.py` splits routes across N workers with status file monitoring, burn-based worker termination, and `--skip-scanned` resume
+
+## Implementation plan
+
+Build the `seataero` CLI as the primary interface. Each step gates the next.
+
+| Step | What | Why |
+|------|------|-----|
+| **1** | **~~Migrate `core/db.py` from PostgreSQL to SQLite.~~** Done. `core/db.py` uses sqlite3 (stdlib), WAL mode, `~/.seataero/data.db`. All callers updated (`--db-path`). Tests rewritten for in-memory SQLite. 58/58 passing. | ~~Eliminates Docker dependency. SQLite is zero-setup.~~ |
+| **2** | **~~CLI skeleton + `setup` command.~~** Done. `cli.py` with argparse subparsers and `pyproject.toml` (`seataero = "cli:main"`). `seataero setup` creates SQLite DB + schema, checks Playwright install, checks `.env` credentials, prints diagnostic report. Supports `--db-path` override and `--json` output. 8 CLI tests passing. | ~~The entry point must exist before any subcommand.~~ |
+| **3** | **~~`search` command.~~** Done. `seataero search YYZ LAX` (single), `seataero search --file routes.txt` (batch), `seataero search --file routes.txt --workers 3` (parallel). Single-route and batch modes call `scrape_route()` in-process (CookieFarm → HybridScraper → scrape_route → DB). Parallel mode delegates to `orchestrate.py` via subprocess (each worker needs its own browser). `--json` returns structured results (route/found/stored/rejected/errors). IATA validation, auto-uppercase, file existence checks. Crash detection with automatic browser restart and retry. 21 CLI tests passing. | ~~Core write path. Merges 3 scripts into one command.~~ |
+| **4** | **~~`query` command.~~** Done. `seataero query YYZ LAX` reads SQLite, prints summary table (one row per date, lowest saver miles per cabin group). `--date 2026-05-01` shows detail view (every record for that date). `--json` outputs raw JSON array. `query_availability(conn, origin, dest, date=None)` in `core/db.py`. Route validation, auto-uppercase, date format validation. 48 tests passing. | ~~Core read path. Users see results without running a web server.~~ |
+| **5** | **~~`status` command.~~** Done. `seataero status` prints formatted report: DB path/size, record count, route coverage, date range, latest scrape, scrape job stats (completed/failed/total). `--json` outputs structured JSON. Handles missing DB ("No database found") and empty DB ("No data yet") gracefully. `get_job_stats(conn)` in `core/db.py`. 57 tests passing. | ~~Users need to know what data they have.~~ |
+| **6** | **~~Query filters + export.~~** Done. `--from`/`--to` date range, `--cabin` filter (economy/business/first with group expansion), `--csv` export, `--sort` (date/miles/cabin). Mutually exclusive validation (`--date` vs `--from`/`--to`, `--csv` vs `--json`). `query_availability` extended with `date_from`, `date_to`, `cabin` SQL filters. 76 tests passing. | ~~Narrow 337 days of data to a travel window.~~ |
+| **7** | **~~Price history.~~** Done. `availability_history` table with INSERT/UPDATE SQLite triggers — automatic price change tracking with zero scraper modifications. `--history` flag on query: route-level summary (lowest/highest/current per cabin) without `--date`, chronological timeline with `--date`. Composes with `--cabin`, `--json`, `--csv`, `--sort`. `query_history` and `get_history_stats` db functions. 94 tests passing. | ~~Historical context for "is this a good price?"~~ |
+| **8** | **~~Alerts.~~** Done. `seataero alert add/list/remove/check` subcommands. `alerts` table in SQLite with route, cabin, max_miles, date range, and notification tracking. `alert check` evaluates all active alerts against current availability, deduplicates via SHA-256 content hashing (`last_notified_hash`), auto-expires past alerts. `--json` across all subcommands. 7 db functions, 6 CLI functions. 129 tests passing. | ~~Passive monitoring — get notified when saver fares appear.~~ |
+| **9** | **~~E2E scraper→CLI tests.~~** Done. `tests/test_e2e.py` — 16 E2E tests with `FakeScraper` exercising `scrape_route()` → real SQLite → CLI read-path. Covers happy path, error handling, circuit breaker, crash detection, scrape→query/status/alert/history round-trips, date edge cases. 250 tests passing. | ~~Closes the write-path integration gap — no automated test exercised `scrape_route()` before.~~ |
+| **10** | **~~Schedule, visualization, agent hints.~~** Done. `seataero schedule add/list/remove/run` with APScheduler 3.x + SQLite persistence. Rich-powered colored tables with inline Unicode sparklines for price trends. `seataero schema [command]` for runtime introspection, `--meta` for field type hints, `--fields` for JSON field selection, structured error JSON. `core/output.py`, `core/schema.py`, `core/scheduler.py`. 282 tests passing (49 new). | ~~CLI needs scheduling, visual output, and agent discoverability.~~ |
+| **11** | **~~In-process scraper integration.~~** Done. Refactored CLI `search` to call `scrape_route()` in-process instead of shelling out via `subprocess.run()`. Single-route and batch modes now use CookieFarm/HybridScraper directly — gives CLI control over output formatting, error handling, and structured JSON. Parallel mode (`--workers > 1`) still delegates to `orchestrate.py` (needs independent browser instances per worker). Removed `_search_single`, `_search_batch`, `_run_script`, `SCRAPE_PY`, `BURN_IN_PY`. Added `verbose` parameter to `scrape_route()` for quiet mode. `tests/test_cli_full.py` with 39 comprehensive tests covering every CLI command. 336 tests passing. | ~~CLI needs direct scraper control for structured output and proper error handling.~~ |
+| **12** | **~~Fix login detection.~~** Done. Rewrote `_is_logged_in()` with inverted detection: visible "Sign in" button as negative signal (fast exit for anonymous/fresh profiles), user-specific DOM content as positive signal. Fixed `_enter_mfa_code()` to navigate to homepage after MFA submission (United SPA doesn't redirect). Replaced fixed 3s wait with `wait_for_selector` for SPA auth state. Fully automated SMS MFA login verified: YYZ-LAX 12/12 windows, 1,398 results, 0 errors. 336 tests passing. | ~~False positive login detection caused immediate cookie burns on fresh profiles.~~ |
+| **13** | **~~Install `seataero` on PATH.~~** Done. Fixed `pyproject.toml` build backend (`setuptools.build_meta`), added explicit package discovery (`py-modules`, `packages`). `pip install -e .` installs `seataero` entry point. | ~~Agents need to call `seataero`, not `python cli.py`.~~ |
+| **14** | **~~Shared parser + --json flag fix.~~** Done. Fixed `--json` flag position bug: refactored to `shared_parser` pattern so `--json`, `--meta`, `--db-path` work after any subcommand (not just before). Updated ~120 test invocations. 336 tests passing. | ~~`--json` only worked before the subcommand, breaking agent usage.~~ |
+| **14b** | **~~MCP server.~~** Done. `mcp_server.py` using FastMCP (`mcp.server.fastmcp`) with 10 `@mcp.tool()` functions: `query_flights` (summary-only), `get_flight_details` (paginated rows), `get_price_trend` (time series), `find_deals` (cross-route deal discovery), `flight_status`, `add_alert`, `check_alerts`, `search_route`, `submit_mfa`, `stop_session`. Summary/detail split pattern: `query_flights` returns ~150-300 tokens (no raw rows); `get_flight_details` provides paginated rows on demand (default 15, max 50). `get_price_trend` returns per-date cheapest miles for graphing. `find_deals` uses server-side SQL aggregation (`find_deals_query` in `core/db.py`) to find below-average pricing across all routes. FastMCP `instructions` provides tool selection decision flow. `ToolAnnotations` on all tools (`readOnlyHint`, `openWorldHint`). Read tools call `core/db.py` directly. Write tools use persistent in-process CookieFarm session (MFA once, browser reused across scrapes). Registered in `.mcp.json` for project-scoped auto-discovery. `seataero-mcp` console script entry point. `mcp[cli]>=1.20` dependency. 35 MCP tool tests in `tests/test_mcp.py`. | ~~Agents discover seataero through typed MCP tool schemas, not agent-specific config files.~~ |
+| **15** | **~~DB as cache with TTL.~~** Done. `get_route_freshness()` in `core/db.py` checks per-route staleness (MAX scraped_at vs configurable TTL). `--refresh` flag on `query` auto-scrapes if data is stale or missing, then returns fresh results. `--ttl HOURS` (default 12) configures staleness threshold. `_scrape_route_live()` extracted as reusable helper for both `search` and `query --refresh`. `--json --meta` output includes `_freshness` block (`latest_scraped_at`, `age_hours`, `is_stale`, `ttl_hours`, `refreshed`). Backward compatible — plain `query` still returns cached data instantly. `build_freshness()` in `core/output.py`. Schema and CLAUDE.md updated for agent discovery. 358 tests passing (13 new). | ~~Prevents agents from confidently reporting fares that no longer exist.~~ |
+| **15b** | **~~MFA-aware MCP server.~~** Done. Upgraded `mcp_server.py` so agents run scrapes conversationally via structured tool contract. `search_route` runs CookieFarm in-process with persistent session (`_session` dict: farm, scraper, logged_in). Cold start: background thread runs `_ensure_session()` + `scrape_route()`, polls `~/.seataero/mfa_request`, returns `{"status": "mfa_required"}` if MFA detected. Warm session: `scrape_route()` runs directly (no MFA, no thread). `submit_mfa(code)` writes code to `~/.seataero/mfa_response`, joins scrape thread, returns results. `stop_session()` shuts down browser. `atexit` handler auto-cleans on server shutdown. `_active_scrape` dict tracks one in-flight scrape (thread, route_key, result, error). `subprocess` import removed. 8 tests in `TestSearchRouteMFA` + 2 in `TestMCPMetadata`. | ~~Closes the natural-language scrape loop.~~ |
+| **16** | **~~Live agent loop test (round 1).~~** Done (2026-04-10). First test revealed agent bypassed all MCP tools and used Bash with raw Python/SQL imports. Root causes: (1) `query_flights` returned flat JSON identical to Bash+SQL — no differentiation, (2) tool descriptions said what tools do, not when to use them, (3) each `search_route` spawned a fresh subprocess — no session reuse. Fix shipped same day: enriched `query_flights` with `_summary`/`_display_hint`/`_format_suggestions`, added FastMCP `instructions` with decision flow, added `ToolAnnotations`, replaced subprocess with persistent in-process CookieFarm, added `stop_session` tool. Re-test confirmed agent used `query_flights` → `search_route` → `submit_mfa` → `query_flights` correctly. Identified token waste: final `query_flights` returned ~10.4k tokens (91 rows) when agent only needed the ~150-token summary. Led to step 16b. | ~~Features that aren't tested from the agent's perspective will have invisible UX bugs.~~ |
+| **16b** | **~~Token-efficient toolkit.~~** Done (2026-04-10). Refactored `query_flights` to summary-only (~150-300 tokens, no raw rows). Added 3 new MCP tools: `get_flight_details` (paginated rows, default 15, max 50, sort by cheapest), `get_price_trend` (per-date cheapest miles time series for graphing), `find_deals` (server-side cross-route deal discovery via SQL CTEs in `find_deals_query()` in `core/db.py`). Updated FastMCP `instructions` with new tool selection flow. Tool count: 7 → 10. 35 MCP tests (was 22). 389 tests passing. | Token waste from `query_flights` returning full row arrays (~10.4k tokens) when agents only needed the summary (~150 tokens). Summary/detail split prevents context window blowup. |
+| **16c** | **Live re-test (token-efficient toolkit).** Repeat step 16 test protocol with the summary/detail split in place. Verify: (1) agent uses `query_flights` and gets ~150-300 token summary, not ~10.4k, (2) agent calls `get_flight_details` only when user asks for a table, (3) `get_price_trend` and `find_deals` work when prompted, (4) multi-turn conversation stays well under context limits. | Confirm the token reduction works in practice from the agent's perspective. |
+| **17** | **Alert → notification workflow.** Close the loop: a scheduled job runs `seataero alert check --json`, and an agent or hook surfaces matches to the user (terminal notification, message, etc.). The CLI already outputs structured alert matches — this step wires a consumer. | Alerts are useless if nobody reads them. |
+
+## Testing strategy
+
+### Pipeline layers
+
+```
+United API  →  parse response  →  validate  →  upsert to SQLite  →  query/alert
+  (network)     (united_api.py)   (models.py)    (db.py)             (db.py / cli.py)
 ```
 
-**Session persistence**: Use Playwright `launch_persistent_context` with a dedicated user data directory for Aeroplan. The hourly scrape cycle keeps the session alive. Re-authenticate with 2FA only when the session expires (detected by redirect to login page).
+### Current test coverage (389 tests)
 
-**Rate limiting**: Keep volume conservative. Air Canada is aggressive about blocking scrapers. For personal use, 50-100 route searches per hour with 5-10 second delays between requests. No proxy needed at this volume from a residential IP.
+| Layer | Test file | Tests | What's real | What's faked |
+|-------|-----------|-------|-------------|--------------|
+| Parse | `test_parser.py` | 8 | Parser logic | API response (synthetic JSON) |
+| Validate | `test_models.py` | 22 | All validation rules | Nothing |
+| Store/Query/Alerts/Freshness | `test_db.py` | 45 | Real in-memory SQLite, triggers, upserts, TTL freshness | Nothing |
+| Web API | `test_api.py` | 17 | Endpoint logic | DB mocked entirely |
+| Scraper state | `test_hybrid_scraper.py` | 5 | State machine | CookieFarm mocked |
+| CLI dispatch | `test_cli.py` | 87 | Arg parsing, search dispatch, query freshness, MFA file handoff | CookieFarm/HybridScraper mocked (search), db mocked (query), temp dir for MFA files |
+| CLI comprehensive | `test_cli_full.py` | 50 | Every CLI command incl. query --refresh/--ttl | CookieFarm/HybridScraper mocked (search), real temp SQLite (query/status/alert) |
+| **L1 Integration** | **`test_integration.py`** | **11** | **Full pipeline: parse→validate→upsert→query→history→alerts** | **API response (synthetic JSON)** |
+| **L2 CLI Integration** | **`test_cli_integration.py`** | **34** | **CLI commands against real temp SQLite incl. freshness metadata** | **Nothing (no mocks)** |
+| **E2E Scraper→CLI** | **`test_e2e.py`** | **16** | **`scrape_route()` → real SQLite → CLI query/status/alert/history** | **`HybridScraper` (FakeScraper returns synthetic API responses)** |
+| Output | `test_output.py` | 20 | Sparkline rendering, auto-TTY, build_meta, build_freshness, print_error, print_table | Nothing (pure unit) |
+| Schema | `test_schema.py` | 14 | Schema introspection, CLI schema command, --fields, --meta | Nothing |
+| Schedule | `test_schedule.py` | 15 | Cron parsing, CLI schedule command | APScheduler mocked |
+| MCP server | `test_mcp.py` | 35 | All 10 MCP tool functions (query_flights summary-only, get_flight_details pagination, get_price_trend, find_deals, MFA-aware search_route + submit_mfa) against real temp SQLite | `db.get_connection` monkeypatched to temp file; subprocess mocked for search/MFA tests |
 
-### Aeroplan phase plan
+Unit tests cover each layer in isolation. L1 integration proves the data-path layers compose. L2 CLI integration proves CLI commands work end-to-end against real databases. E2E tests prove the full scraper write-path composes correctly with the CLI read-path.
 
-1. Get Aeroplan account working (mobile app or phone call if website fails)
-2. Open DevTools, capture the full auth flow (login + 2FA) and search flow network requests
-3. Build Playwright scraper with persistent context and IMAP-based 2FA handling
-4. Get one route working end-to-end: YYZ-SFO, parse results, store in database
-5. Expand to 10-50 personal routes alongside the United scraper
-6. Add Aeroplan results to the same web UI and alert system
+### End-to-end test plan
 
-The framework from United (database, alerts, scheduling, web UI) carries over unchanged. Only the scraper plugin is new.
+Three levels, each building on the last. No test at any level hits United's real servers.
+
+**Level 1: Data path integration** (`tests/test_integration.py`) — **Done.**
+
+11 integration tests across 5 test classes, stitching parse → validate → store → query → history → alerts with synthetic API data and real in-memory SQLite:
+
+- `TestParseToValidate` (2 tests) — parser output validates successfully for all cabin types; unknown cabins rejected
+- `TestParseToStore` (2 tests) — full pipeline (2 dates × 3 cabins = 6 solutions) through parse→validate→upsert→query; cabin/date/date_from filters verified
+- `TestHistoryIntegration` (3 tests) — INSERT trigger creates history on first upsert; UPDATE trigger tracks price changes (13000→15000 miles); unchanged prices produce no duplicate history
+- `TestAlertIntegration` (3 tests) — alert matching on pipeline data; cabin-filtered alerts; notification hash round-trip stability
+- `TestAwardTypeCoexistence` (1 test) — Saver and Standard award types coexist as separate rows for same cabin/date
+
+Catches: field name mismatches between layers, SQL type errors, trigger failures, alert dedup hash drift.
+
+**Level 2: CLI integration** (`tests/test_cli_integration.py`) — **Done.**
+
+32 CLI integration tests across 7 test classes. Pre-seeds a real temp SQLite file, then runs CLI commands via `main(["--db-path", ...])` with no mocked DB:
+
+- `TestSetupIntegration` (2 tests) — schema creation with `--db-path`, JSON output validation
+- `TestQueryIntegration` (5 tests) — summary table, detail view with taxes, JSON (7 records), no-results, CSV with header/row validation
+- `TestQueryFiltersIntegration` (7 tests) — cabin expansion (economy→3 rows, business→2), date range, date_from, combined cabin+date, sort by miles/cabin
+- `TestQueryHistoryIntegration` (5 tests) — route summary text/JSON with lowest/highest/observations, date timeline, cabin filter on history
+- `TestStatusIntegration` (4 tests) — text/JSON output with counts, missing DB, empty DB
+- `TestAlertIntegration` (7 tests) — add/list, cabin+date filters, check finds matches, cabin filter on check, hash dedup, remove, remove nonexistent
+- `TestPriceChangeCLI` (2 tests) — price drop triggers alert refire via changed hash, history reflects both observations
+
+Catches: CLI arg parsing regressions, `--db-path` forwarding, output formatting, cabin filter expansion, sort logic, alert dedup hash drift through CLI.
+
+**Level 2.5: E2E Scraper→CLI round-trip** (`tests/test_e2e.py`) — **Done.**
+
+16 E2E tests across 6 test classes, bridging the write-path gap between L1 (data-path from parsed JSON) and L2 (CLI on pre-seeded DB). Uses a `FakeScraper` that returns synthetic API responses — `scrape_route()` runs for real with a temp SQLite DB, then CLI commands verify the stored data:
+
+- `TestScrapeRouteIntegration` (3 tests) — `scrape_route()` stores all 12 windows (36 solutions), records scrape_jobs, returns correct totals with custom responses
+- `TestScrapeRouteErrors` (3 tests) — failed windows record failed jobs, circuit breaker aborts after 3 consecutive burns, mixed success/failure counts
+- `TestCrashDetection` (3 tests) — `_scrape_with_crash_detection()` identifies browser crash keywords, ignores partial failures, ignores non-browser errors
+- `TestScrapeToCliRoundTrip` (3 tests) — full pipeline: scrape → CLI `query`/`status`/`alert check` via `main(["--db-path", ...])`
+- `TestScrapeHistoryRoundTrip` (2 tests) — price change tracked in history through full pipeline, alert re-fires on price drop
+- `TestScrapeDateEdgeCases` (2 tests) — past dates and far-future dates rejected by validator during scrape
+
+Catches: `scrape_route()` orchestration bugs, circuit breaker logic, crash detection, scrape_job recording, write-path → read-path composition failures.
+
+**Level 3: Scraper smoke test** (manual gate, hits United servers)
+
+The only level that makes real HTTP requests. Requires a live MileagePlus session, Playwright, and network access. Too flaky/slow for CI — run manually before releases:
+
+```bash
+seataero search YYZ LAX --db-path /tmp/test.db
+seataero query YYZ LAX --db-path /tmp/test.db
+```
+
+The existing burn-in infrastructure (`burn_in.py --one-shot`) is this test. The 15-route, 180/180-window, 0-error burn-in result documented above serves as the E2E validation gate. Additionally, `seataero search YYZ LAX --delay 7` completed 12/12 windows (1,398 results, 0 errors) with fully automated SMS MFA login on 2026-04-09.
+
+### What each level catches
+
+| Bug class | L1 | L2 | E2E | L3 |
+|-----------|----|----|-----|-----|
+| Field name mismatch between parse/validate | Yes | | | |
+| SQL type errors (str vs int) | Yes | | | |
+| Trigger not firing on upsert | Yes | | Yes | |
+| Alert dedup hash drift | Yes | | | |
+| `scrape_route()` orchestration broken | | | Yes | |
+| Circuit breaker logic broken | | | Yes | |
+| Crash detection false positive/negative | | | Yes | |
+| Scrape job recording incorrect | | | Yes | |
+| Write-path → read-path composition failure | | | Yes | |
+| CLI arg parsing regression | | Yes | | |
+| `--db-path` not forwarded correctly | | Yes | | |
+| Output formatting broken | | Yes | | |
+| United changed their API shape | | | | Yes |
+| Cookie/auth session expired | | | | Yes |
+| Validation rejecting real API data | | | | Yes |

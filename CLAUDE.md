@@ -11,17 +11,20 @@ cd C:/Users/jiami/local_workspace/seataero
 C:/Users/jiami/local_workspace/seataero/scripts/experiments/.venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
+## Agent Integration
+For flight queries and scraping, use the seataero MCP tools (query_flights, search_route, submit_mfa, etc.). Do not use Bash or raw SQL.
+
 ## Project Structure
-- `core/` — Data models (models.py) and database layer (db.py)
+- `cli.py` — Main CLI entry point (`seataero` command)
+- `core/` — Data models (models.py) and database layer (db.py, SQLite)
 - `scripts/experiments/` — Hybrid scraper, cookie farm, United API utilities
-- `scrape.py` — Main CLI entry point (single route)
+- `scrape.py` — Single-route scraper (called by CLI search)
 - `scripts/burn_in.py` — Multi-route runner with JSONL logging (supports `--one-shot` for single-pass and `--burn-limit` for auto-exit on cookie burns)
 - `scripts/orchestrate.py` — Parallel orchestrator: splits routes across N workers, monitors health via status files, kills burned-out workers
 - `scripts/analyze_burn_in.py` — Burn-in log analysis and reporting
 - `scripts/verify_data.py` — Data verification reporting
 - `routes/canada_test.txt` — 15 Canada→US test routes
 - `routes/canada_us_all.txt` — Full Canada→US route list for production runs
-- `docker-compose.yml` — PostgreSQL 16 container
 
 ## Burn-In Testing
 ```bash
@@ -41,20 +44,7 @@ scripts/experiments/.venv/Scripts/python.exe scripts/orchestrate.py \
 scripts/experiments/.venv/Scripts/python.exe scripts/analyze_burn_in.py logs/burn_in_*.jsonl
 ```
 
-## Web UI
-```bash
-# Start backend (FastAPI on port 8000)
-cd C:/Users/jiami/local_workspace/seataero
-scripts/experiments/.venv/Scripts/python.exe -m uvicorn web.api:app --reload --port 8000
-
-# Start frontend (Next.js on port 3000, in a separate terminal)
-cd C:/Users/jiami/local_workspace/seataero/web/frontend
-npm run dev
-```
-- Backend: http://localhost:8000 (API endpoints: /api/health, /api/search, /api/search/detail)
-- Frontend: http://localhost:3000
-- Requires PostgreSQL to be running
-
 ## Database
-- PostgreSQL via Docker: `docker compose up -d`
-- Connection: `postgresql://seataero:seataero_dev@localhost:5432/seataero`
+- SQLite at `~/.seataero/data.db` (default)
+- Override with `--db-path` flag or `SEATAERO_DB` env var
+- Schema created via `seataero setup` or `--create-schema` flag

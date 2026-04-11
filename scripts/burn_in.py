@@ -11,10 +11,8 @@ Usage:
 """
 
 import argparse
-import io
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -28,21 +26,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core import db, models  # noqa: E402
 from cookie_farm import CookieFarm  # noqa: E402
 from hybrid_scraper import HybridScraper, load_routes_file  # noqa: E402
-from scrape import scrape_route  # noqa: E402
+from scrape import scrape_route, detect_browser_crash  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-# Pattern to capture per-window FAILED/ERROR lines printed by scrape_route().
-# Examples:
-#   "  Window 3/12 (2026-05-02): FAILED — timeout"
-#   "  Window 7/12 (2026-07-31): ERROR — cookie_burn"
-_WINDOW_ERROR_RE = re.compile(
-    r"Window\s+(\d+)/12\s+\([^)]+\):\s+(?:FAILED|ERROR)\s*[—-]\s*(.*)",
-)
-
 
 def _write_status_file(worker_id, status_data, log_dir="logs"):
     """Atomically write worker status to a JSON file."""
@@ -58,51 +47,23 @@ def _write_status_file(worker_id, status_data, log_dir="logs"):
         pass
 
 
-def _capture_scrape_route(origin, dest, conn, scraper, delay):
-    """Run scrape_route() while capturing its stdout to extract error details.
-
-    scrape_route() prints per-window results to stdout. We tee the output so
-    it still appears on the console, but also parse it for FAILED/ERROR lines
-    to populate the JSONL errors list.
+def _capture_scrape_route(origin, dest, conn, scraper, delay, start_window=1, max_windows=12):
+    """Run scrape_route() and extract error details from structured return data.
 
     Returns:
         (totals_dict, error_strings, cookie_refreshed_flag)
     """
-    old_stdout = sys.stdout
-    capture = io.StringIO()
+    totals = scrape_route(origin, dest, conn, scraper, delay=delay, start_window=start_window, max_windows=max_windows)
 
-    class Tee:
-        """Write to both the real stdout and an in-memory buffer."""
-        def __init__(self, real, buffer):
-            self._real = real
-            self._buffer = buffer
+    # Extract per-window error messages from structured data
+    error_strings = []
+    for i, msg in enumerate(totals.get("error_messages", []), 1):
+        error_strings.append(f"Window {i}: {msg}")
 
-        def write(self, data):
-            self._real.write(data)
-            self._buffer.write(data)
+    # Cookie refresh detection not available from structured data
+    cookie_refreshed = False
 
-        def flush(self):
-            self._real.flush()
-
-    sys.stdout = Tee(old_stdout, capture)
-    try:
-        totals = scrape_route(origin, dest, conn, scraper, delay=delay)
-    finally:
-        sys.stdout = old_stdout
-
-    captured = capture.getvalue()
-
-    # Extract per-window error messages
-    errors = []
-    for match in _WINDOW_ERROR_RE.finditer(captured):
-        window_num = match.group(1)
-        error_msg = match.group(2).strip()
-        errors.append(f"Window {window_num}: {error_msg}")
-
-    # Detect if a cookie refresh happened (HybridScraper prints this)
-    cookie_refreshed = "cookie refresh" in captured.lower() or "Cookies refreshed" in captured
-
-    return totals, errors, cookie_refreshed
+    return totals, error_strings, cookie_refreshed
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create/update database schema before starting",
     )
     parser.add_argument(
-        "--database-url",
+        "--db-path",
         type=str,
         default=None,
-        help="PostgreSQL connection string (overrides DATABASE_URL env var)",
+        help="Path to SQLite database file (overrides SEATAERO_DB env var)",
     )
     parser.add_argument(
         "--env-file",
@@ -214,6 +175,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Exit if total circuit breaks reach this limit (default: 10)",
+    )
+    parser.add_argument(
+        "--start-window",
+        type=int,
+        default=1,
+        help="Start from window N (1-indexed, default: 1)",
+    )
+    parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=12,
+        help="Maximum windows to scrape per route (default: 12)",
+    )
+    parser.add_argument(
+        "--http-version",
+        choices=["h1", "h2"],
+        default="h2",
+        help="HTTP version: h1 for HTTP/1.1, h2 for HTTP/2 (default: h2)",
+    )
+    parser.add_argument(
+        "--wait-login",
+        action="store_true",
+        help="Pause after opening browser so you can log in manually",
     )
     return parser
 
@@ -284,6 +268,8 @@ def main():
     print(f"Session budget:    every {args.session_budget} requests")
     print(f"Session pause:     {args.session_pause}s on budget reset")
     print(f"Route delay:       {args.route_delay}s between routes")
+    print(f"Start window:      {args.start_window}")
+    print(f"Max windows:       {args.max_windows}")
     print(f"Headless:          {args.headless}")
     print(f"Profile:           {'persistent' if args.persist_profile else 'ephemeral (fresh)'}")
     if args.env_file:
@@ -301,12 +287,12 @@ def main():
     )
     print(f"\nLog file: {log_filename}")
 
-    # Connect to PostgreSQL
-    print("\nConnecting to PostgreSQL...")
+    # Connect to database
+    print("\nConnecting to database...")
     try:
-        conn = db.get_connection(args.database_url)
+        conn = db.get_connection(args.db_path)
     except Exception as exc:
-        print(f"Cannot connect to PostgreSQL. Run `docker compose up -d` first.")
+        print(f"Cannot connect to database. Check that the database file exists at the given path.")
         print(f"  Error: {exc}")
         sys.exit(1)
 
@@ -331,11 +317,19 @@ def main():
             sys.exit(1)
 
         try:
+            if args.wait_login:
+                farm._page.goto("https://www.united.com/en/us/", wait_until="domcontentloaded", timeout=30000)
+                wait = 45
+                print(f"\n>>> Log in to United in the browser. Waiting {wait}s...")
+                for remaining in range(wait, 0, -1):
+                    print(f"  {remaining}s remaining...", end="\r")
+                    time.sleep(1)
+                print("  Continuing...                ")
             farm.ensure_logged_in()
 
             # Start hybrid scraper
             print("\nStarting hybrid scraper...")
-            scraper = HybridScraper(farm, refresh_interval=args.refresh_interval, session_budget=args.session_budget, session_pause=args.session_pause)
+            scraper = HybridScraper(farm, refresh_interval=args.refresh_interval, session_budget=args.session_budget, session_pause=args.session_pause, http_version=args.http_version)
             scraper.start()
 
             try:
@@ -408,15 +402,17 @@ def _run_burn_in(args, routes, conn, farm, scraper, log_filename, duration_secon
                         break
 
                     route_label = f"{orig}-{dest}"
-                    print(f"\n  Scraping {route_label} (12 windows)...")
+                    actual_windows = min(args.max_windows, 12 - args.start_window + 1)
+                    print(f"\n  Scraping {route_label} (windows {args.start_window}-{min(args.start_window + args.max_windows - 1, 12)} of 12)...")
 
                     route_start = time.time()
                     totals, error_strings, cookie_refreshed = _capture_scrape_route(
                         orig, dest, conn, scraper, delay=args.delay,
+                        start_window=args.start_window, max_windows=args.max_windows,
                     )
                     route_duration = time.time() - route_start
 
-                    windows_ok = 12 - totals["errors"]
+                    windows_ok = totals.get("total_windows", args.max_windows) - totals["errors"]
                     windows_failed = totals["errors"]
 
                     # Build JSONL record
@@ -438,6 +434,9 @@ def _run_burn_in(args, routes, conn, farm, scraper, log_filename, duration_secon
                         "circuit_break": totals.get("circuit_break", False),
                         "requests_this_session": scraper.requests_this_session,
                         "total_burns_cumulative": total_burns,
+                        "session_budget": args.session_budget,
+                        "start_window": args.start_window,
+                        "max_windows": args.max_windows,
                     }
 
                     # Write and flush
@@ -468,19 +467,15 @@ def _run_burn_in(args, routes, conn, farm, scraper, log_filename, duration_secon
                     cycle_errors += totals["errors"]
 
                     print(f"  {route_label}: "
-                          f"{windows_ok}/12 OK, "
+                          f"{windows_ok}/{totals.get('total_windows', args.max_windows)} OK, "
                           f"{totals['found']} found, "
                           f"{totals['stored']} stored, "
                           f"{totals['rejected']} rejected, "
                           f"{totals['errors']} errors  "
                           f"({route_duration:.1f}s)")
 
-                    # Browser crash detection — all 12 windows failed with
-                    # Playwright "browser has been closed" errors
-                    browser_crashed = (
-                        windows_failed == 12
-                        and any("browser has been closed" in e for e in error_strings)
-                    )
+                    # Browser crash detection via structured error data
+                    browser_crashed = detect_browser_crash(totals)
                     if browser_crashed:
                         print("\n  BROWSER CRASH detected — restarting browser...")
                         scraper.stop()
