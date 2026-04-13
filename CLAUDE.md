@@ -16,8 +16,7 @@ For flight queries and scraping, use the seataero MCP tools (query_flights, sear
 
 ## Project Structure
 - `cli.py` — Main CLI entry point (`seataero` command)
-- `core/` — Data models (models.py) and database layer (db.py, SQLite)
-- `scripts/experiments/` — Hybrid scraper, cookie farm, United API utilities
+- `core/` — Data models, database layer, scraper modules (cookie_farm, hybrid_scraper, united_api), shared logic (matching, routes)
 - `scrape.py` — Single-route scraper (called by CLI search)
 - `scripts/burn_in.py` — Multi-route runner with JSONL logging (supports `--one-shot` for single-pass and `--burn-limit` for auto-exit on cookie burns)
 - `scripts/orchestrate.py` — Parallel orchestrator: splits routes across N workers, monitors health via status files, kills burned-out workers
