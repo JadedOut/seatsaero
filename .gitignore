@@ -21,18 +21,26 @@ scripts/experiments/.env
 scripts/experiments/*.log
 scripts/experiments/__pycache__/
 
-# Browser profile (contains session cookies, login state)
+# Browser profiles (contains session cookies, login state)
 scripts/experiments/.browser-profile/
+.browser-profile*
 
 # MFA handoff files
 scripts/experiments/.mfa_request
 scripts/experiments/.mfa_code
+
+# Specs (Claude-only planning docs)
+specs/
+
+# Claude local config
+.claude/
 
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+*.egg-info/
 
 # Database
 pgdata/
