@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seataero"
-version = "0.1.0"
+version = "0.1.1"
 description = "United MileagePlus award flight search CLI"
-requires-python = ">=3.11"
+readme = "README.md"
+requires-python = ">=3.13"
 dependencies = [
     "curl_cffi>=0.7",
     "playwright>=1.40",
@@ -16,6 +17,7 @@ dependencies = [
     "fastmcp[tasks]>=3.0",
     "asciichartpy>=1.5",
     "tabulate>=0.9",
+    "pydantic>=2.12",
 ]
 
 [tool.setuptools]
