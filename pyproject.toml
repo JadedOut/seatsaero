@@ -14,14 +14,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "python-ghost-cursor>=0.1.1",
     "rich>=13.0",
-    "fastmcp[tasks]>=3.0",
     "asciichartpy>=1.5",
     "tabulate>=0.9",
-    "pydantic>=2.12",
 ]
 
 [tool.setuptools]
-py-modules = ["cli", "scrape", "mcp_server"]
+py-modules = ["cli", "scrape"]
 packages = ["core"]
 
 [tool.pytest.ini_options]
@@ -29,4 +27,3 @@ pythonpath = ["."]
 
 [project.scripts]
 seataero = "cli:main"
-seataero-mcp = "mcp_server:main"

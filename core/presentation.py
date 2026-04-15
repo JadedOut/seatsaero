@@ -491,7 +491,60 @@ def format_deals_table(
 
 
 # ---------------------------------------------------------------------------
-# 5. format_general
+# 5. compute_summary
+# ---------------------------------------------------------------------------
+
+def compute_summary(rows):
+    """Compute summary stats from query results.
+
+    Args:
+        rows: List of dicts with keys: date, cabin, award_type, miles,
+              taxes_cents, scraped_at.
+
+    Returns:
+        Summary dict with keys: cheapest, saver_dates, standard_dates,
+        miles_range, date_range, data_age_hours, cabins_available.
+        Returns None if rows is empty.
+    """
+    if not rows:
+        return None
+
+    cheapest = min(rows, key=lambda r: r["miles"])
+    saver_rows = [r for r in rows if r["award_type"] == "Saver"]
+    standard_rows = [r for r in rows if r["award_type"] == "Standard"]
+    saver_dates = len(set(r["date"] for r in saver_rows))
+    standard_dates = len(set(r["date"] for r in standard_rows))
+    miles_values = [r["miles"] for r in rows]
+    dates = sorted(set(r["date"] for r in rows))
+    cabins = sorted(set(r["cabin"] for r in rows))
+
+    # Data age from most recent scraped_at
+    latest_scraped = max(r["scraped_at"] for r in rows)
+    try:
+        scraped_dt = datetime.fromisoformat(latest_scraped.replace("Z", "+00:00"))
+        age_hours = round((datetime.now(timezone.utc) - scraped_dt).total_seconds() / 3600, 1)
+    except Exception:
+        age_hours = None
+
+    return {
+        "cheapest": {
+            "date": cheapest["date"],
+            "cabin": cheapest["cabin"],
+            "award_type": cheapest["award_type"],
+            "miles": cheapest["miles"],
+            "taxes_cents": cheapest.get("taxes_cents"),
+        },
+        "saver_dates": saver_dates,
+        "standard_dates": standard_dates,
+        "miles_range": [min(miles_values), max(miles_values)],
+        "date_range": [dates[0], dates[-1]] if dates else [],
+        "data_age_hours": age_hours,
+        "cabins_available": cabins,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. format_general
 # ---------------------------------------------------------------------------
 
 def format_general(text: str) -> str:

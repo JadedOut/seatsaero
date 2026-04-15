@@ -12,7 +12,7 @@ C:/Users/jiami/local_workspace/seataero/scripts/experiments/.venv/Scripts/python
 ```
 
 ## Agent Integration
-For flight queries and scraping, use the seataero MCP tools (query_flights, search_route, submit_mfa, etc.). Do not use Bash or raw SQL.
+For flight queries and scraping, use the `/flights` skill or call seataero CLI commands directly. Do not use raw SQL or import core modules directly.
 
 ## Project Structure
 - `cli.py` — Main CLI entry point (`seataero` command)

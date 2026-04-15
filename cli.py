@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import datetime
 
-from core import db
+from core import db, presentation
 from core.matching import CABIN_FILTER_MAP as _CABIN_FILTER_MAP, compute_match_hash as _compute_match_hash
 from core.output import get_console, sparkline, print_error
 from core.routes import load_routes as _load_routes
@@ -426,10 +426,10 @@ def cmd_search(args):
         return _search_single_inproc(args)
 
 
-def _scrape_route_live(origin, dest, conn, delay=3.0, json_mode=False, headless=True, mfa_prompt=None, proxy=None):
+def _scrape_route_live(origin, dest, conn, delay=3.0, json_mode=False, headless=True, mfa_prompt=None, proxy=None, ephemeral=False, mfa_method="sms"):
     """Scrape a single route in-process. Reusable by both search and query --refresh.
 
-    Starts CookieFarm (headless, ephemeral), logs in, scrapes all 12 windows,
+    Starts CookieFarm, logs in, scrapes all 12 windows,
     handles browser crash with one retry, cleans up.
 
     Args:
@@ -440,6 +440,8 @@ def _scrape_route_live(origin, dest, conn, delay=3.0, json_mode=False, headless=
         json_mode: If True, suppress verbose stdout output.
         headless: If True, run browser in headless mode.
         proxy: Proxy URL (e.g., socks5://user:pass@host:port). Also reads PROXY_URL env var.
+        ephemeral: If True, use ephemeral browser profile (default: persistent).
+        mfa_method: MFA delivery channel — "sms" or "email" (default: "sms").
 
     Returns:
         dict with keys: found, stored, rejected, errors, total_windows, circuit_break, error_messages.
@@ -448,10 +450,10 @@ def _scrape_route_live(origin, dest, conn, delay=3.0, json_mode=False, headless=
     scraper = None
     try:
         _log("Starting cookie farm...")
-        farm = CookieFarm(headless=headless, ephemeral=True, proxy=proxy)
+        farm = CookieFarm(headless=headless, ephemeral=ephemeral, proxy=proxy)
         farm.start()
         _log("Logging in to United...")
-        farm.ensure_logged_in(mfa_prompt=mfa_prompt or _prompt_sms_code)
+        farm.ensure_logged_in(mfa_prompt=mfa_prompt or _prompt_sms_code, mfa_method=mfa_method)
         _log("Login confirmed")
 
         _log("Starting hybrid scraper...")
@@ -505,7 +507,7 @@ def _search_single_inproc(args):
         db.ensure_schema(conn)
 
         mfa_prompt = _get_mfa_prompt(args)
-        totals = _scrape_route_live(orig, dest, conn, delay=args.delay, json_mode=args.json, headless=args.headless, mfa_prompt=mfa_prompt, proxy=getattr(args, 'proxy', None))
+        totals = _scrape_route_live(orig, dest, conn, delay=args.delay, json_mode=args.json, headless=args.headless, mfa_prompt=mfa_prompt, proxy=getattr(args, 'proxy', None), ephemeral=args.ephemeral, mfa_method=args.mfa_method)
 
         # Output results
         if args.json:
@@ -578,10 +580,10 @@ def _search_batch(args):
 
         # Start cookie farm
         _log("Starting cookie farm...")
-        farm = CookieFarm(headless=args.headless, ephemeral=True, proxy=getattr(args, 'proxy', None))
+        farm = CookieFarm(headless=args.headless, ephemeral=args.ephemeral, proxy=getattr(args, 'proxy', None))
         farm.start()
         _log("Logging in to United...")
-        farm.ensure_logged_in(mfa_prompt=mfa_prompt)
+        farm.ensure_logged_in(mfa_prompt=mfa_prompt, mfa_method=args.mfa_method)
         _log("Login confirmed")
 
         # Start hybrid scraper
@@ -616,7 +618,7 @@ def _search_batch(args):
                 _log(f"  BROWSER CRASH on {orig}-{dest} — restarting browser...")
                 scraper.stop()
                 farm.restart()
-                farm.ensure_logged_in(mfa_prompt=mfa_prompt)
+                farm.ensure_logged_in(mfa_prompt=mfa_prompt, mfa_method=args.mfa_method)
                 scraper.start()
                 scraper.reset_backoff()
                 _log(f"  Browser restarted, retrying {orig}-{dest}...")
@@ -650,7 +652,7 @@ def _search_batch(args):
                 _log("  Circuit breaker: refreshing session...")
                 scraper.stop()
                 farm.refresh_cookies()
-                farm.ensure_logged_in(mfa_prompt=mfa_prompt)
+                farm.ensure_logged_in(mfa_prompt=mfa_prompt, mfa_method=args.mfa_method)
                 scraper.start()
                 scraper.reset_backoff()
                 _log("  Session refreshed, continuing")
@@ -789,6 +791,20 @@ def cmd_query(args):
         print("Error: --refresh cannot be combined with --history")
         return 1
 
+    # Validate --graph and --summary cannot be combined with --history
+    if args.graph and args.history:
+        print("Error: --graph cannot be combined with --history")
+        return 1
+    if args.summary and args.history:
+        print("Error: --summary cannot be combined with --history")
+        return 1
+
+    # Validate format flags are mutually exclusive
+    format_flags = sum([args.graph, args.summary, args.csv, args.json])
+    if format_flags > 1:
+        print("Error: --graph, --summary, --csv, and --json are mutually exclusive")
+        return 1
+
     # Validate date format if provided
     if args.date:
         try:
@@ -839,7 +855,7 @@ def cmd_query(args):
             try:
                 db.ensure_schema(conn)
                 mfa_prompt = _get_mfa_prompt(args)
-                _scrape_route_live(origin, dest, conn, json_mode=args.json, mfa_prompt=mfa_prompt, proxy=getattr(args, 'proxy', None))
+                _scrape_route_live(origin, dest, conn, json_mode=args.json, mfa_prompt=mfa_prompt, proxy=getattr(args, 'proxy', None), mfa_method=args.mfa_method)
                 refreshed = True
                 _log("Scrape complete — querying fresh data")
                 # Re-check freshness after scrape
@@ -868,6 +884,24 @@ def cmd_query(args):
     # Apply sort
     if args.sort != "date":
         rows = sorted(rows, key=_SORT_KEYS[args.sort])
+
+    # Presentation output modes
+    if args.graph:
+        # Aggregate to per-date cheapest miles
+        by_date = {}
+        for r in rows:
+            d = r["date"]
+            if d not in by_date or r["miles"] < by_date[d]["miles"]:
+                by_date[d] = {"date": d, "miles": r["miles"],
+                              "cabin": r["cabin"], "award_type": r["award_type"]}
+        trend = sorted(by_date.values(), key=lambda x: x["date"])
+        print(presentation.format_price_chart(trend, origin, dest, cabin_filter=args.cabin))
+        return 0
+
+    if args.summary:
+        summary = presentation.compute_summary(rows)
+        print(presentation.format_summary_card(summary, origin, dest, count=len(rows)))
+        return 0
 
     # Output
     if args.json:
@@ -1114,6 +1148,31 @@ def _print_query_history_summary(stats, current_rows, origin, dest, conn=None):
             table.add_row(cabin_group, award_type, low, high, cur, str(g["observations"]), trend_str)
 
     get_console().print(table)
+
+
+def cmd_deals(args):
+    """Find best deals across all cached routes."""
+    max_results = max(1, min(getattr(args, 'max_results', 10), 25))
+    cabin_filter = _CABIN_FILTER_MAP.get(args.cabin) if args.cabin else None
+
+    conn = db.get_connection(args.db_path)
+    try:
+        deals = db.find_deals_query(conn, cabin=cabin_filter, max_results=max_results)
+    finally:
+        conn.close()
+
+    if not deals:
+        if args.json:
+            print(json.dumps({"deals_found": 0, "message": "No deals found."}))
+        else:
+            print("No deals found. Data may be too fresh for comparison.")
+        return 0
+
+    if args.json:
+        print(json.dumps({"deals_found": len(deals), "deals": deals}, indent=2))
+    else:
+        print(presentation.format_deals_table(deals, cabin_filter=args.cabin))
+    return 0
 
 
 def _format_size(size_bytes):
@@ -2031,6 +2090,10 @@ def main(argv=None):
     search_parser.add_argument("--skip-scanned", "--no-skip-scanned", action=argparse.BooleanOptionalAction, default=True, help="Skip already-scanned routes (parallel mode)")
     search_parser.add_argument("--mfa-file", action="store_true", default=False,
                                help="Use file-based MFA handoff (~/.seataero/mfa_response) instead of stdin prompt")
+    search_parser.add_argument("--mfa-method", choices=["sms", "email"], default="sms",
+                               help="MFA delivery channel (default: sms). Use 'email' for automated workflows.")
+    search_parser.add_argument("--ephemeral", action="store_true", default=False,
+                               help="Use ephemeral browser profile (default: persistent)")
 
     query_parser = subparsers.add_parser("query", help="Query stored availability data",
                                           parents=[shared_parser])
@@ -2058,9 +2121,23 @@ def main(argv=None):
                               help="Hours before cached data is considered stale (default: 12)")
     query_parser.add_argument("--mfa-file", action="store_true", default=False,
                               help="Use file-based MFA handoff for --refresh scrapes")
+    query_parser.add_argument("--mfa-method", choices=["sms", "email"], default="sms",
+                              help="MFA delivery channel for --refresh scrapes (default: sms)")
+    query_parser.add_argument("--graph", action="store_true", default=False,
+                              help="Show price trend as ASCII chart")
+    query_parser.add_argument("--summary", action="store_true", default=False,
+                              help="Show deal summary card")
 
     subparsers.add_parser("status", help="Show database statistics and coverage",
                           parents=[shared_parser])
+
+    deals_parser = subparsers.add_parser("deals", help="Find best deals across all cached routes",
+                                          parents=[shared_parser])
+    deals_parser.add_argument("--cabin", "-c", default=None,
+                              choices=["economy", "business", "first"],
+                              help="Filter by cabin class")
+    deals_parser.add_argument("--max-results", type=int, default=10,
+                              help="Maximum deals to show (1-25, default 10)")
 
     alert_parser = subparsers.add_parser("alert", help="Manage price alerts")
     alert_sub = alert_parser.add_subparsers(dest="alert_command")
@@ -2182,6 +2259,9 @@ def main(argv=None):
 
     if args.command == "query":
         return cmd_query(args)
+
+    if args.command == "deals":
+        return cmd_deals(args)
 
     if args.command == "status":
         return cmd_status(args)
